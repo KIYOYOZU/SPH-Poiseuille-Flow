@@ -25,11 +25,13 @@ $$u(y) = \frac{1}{2\mu} \left|\frac{dp}{dx}\right| y(H - y)$$
 
 - **核函数：** 2D Cubic Spline
 - **邻居搜索：** Cell-Linked List（网格链表法），支持周期性边界
+- **计算加速：** 融合单步 MEX（邻居搜索 + 力学计算一次调用完成）
 - **时间积分：** Velocity Verlet 格式 + 自适应时间步长（CFL & 粘性条件）
 - **密度计算：** 核函数求和 + Shepard 密度修正
 - **压力方程：** 弱可压缩状态方程 p = cs²(ρ - ρ₀)
 - **粘性模型：** Morris (1997) 粘性项
 - **速度修正：** XSPH 修正（ε = 0.5）
+- **稳态控制：** 双指标提前停止（u_max 变化率 + 速度剖面残差）
 - **边界条件：** 壁面镜像速度无滑移 + x 方向周期性边界
 
 ## 模拟结果
@@ -47,6 +49,25 @@ $$u(y) = \frac{1}{2\mu} \left|\frac{dp}{dx}\right| y(H - y)$$
 ### 环境要求
 
 - MATLAB R2018b 或更高版本
+- 支持 OpenMP 的 C 编译器（推荐：Windows 使用 MSVC，Linux/macOS 使用 GCC）
+
+### MEX 编译
+
+程序首次运行时会**自动检测并编译** MEX 加速模块，编译输出存放在 `build/` 目录，无需手动操作。如需手动编译：
+
+```matlab
+% 编译融合单步 MEX（推荐，性能最优）
+mex -R2018a -O COMPFLAGS="$COMPFLAGS /openmp" -output sph_step_mex_v1 -outdir build mex/sph_step_mex.c
+
+% 或编译旧版独立 MEX 模块（可选）
+mex -R2018a -O COMPFLAGS="$COMPFLAGS /openmp" -outdir build mex/sph_compute_forces_mex.c
+mex -R2018a -O COMPFLAGS="$COMPFLAGS /openmp" -outdir build mex/cell_linked_list_search_mex.c
+```
+
+**注意：**
+- Windows 使用 `/openmp`，Linux/macOS 使用 `-fopenmp`
+- MEX 编译失败时程序自动回退到 MATLAB 实现（性能较慢但功能完整）
+- C 源文件位于 `mex/` 目录，编译产物存放在 `build/` 目录（两个目录会自动创建并已在 `.gitignore` 中忽略）
 
 ### 运行
 
@@ -58,12 +79,31 @@ run('SPH_Poiseuille.m')
 
 程序将自动完成粒子初始化、SPH 模拟计算（约 5 秒物理时间）并输出结果对比图。
 
+### 可选环境变量
+
+- `SPH_FORCE_MATLAB=1`：禁用 MEX，强制走 MATLAB 回退实现
+- `SPH_T_END=<正数>`：覆盖默认物理仿真终止时间（单位秒）
+- `SPH_EARLY_STOP=0`：关闭稳态提前停止，强制跑满 `t_end`
+
+PowerShell 示例：
+
+```powershell
+$env:SPH_T_END = "0.01"
+matlab -batch "run('SPH_Poiseuille.m')"
+Remove-Item Env:SPH_T_END
+```
+
 ## 文件说明
 
-| 文件 | 说明 |
+| 文件/目录 | 说明 |
 |------|------|
-| `SPH_Poiseuille.m` | 主程序，包含完整的 SPH 模拟代码 |
+| `SPH_Poiseuille.m` | 主程序，包含完整的 SPH 模拟代码与 MATLAB 回退实现 |
+| `mex/sph_step_mex.c` | 融合单步 MEX（C+OpenMP）：邻居搜索 + 密度/压力/力计算 |
+| `mex/cell_linked_list_search_mex.c` | 独立邻居搜索 MEX（旧版，保留供参考） |
+| `mex/sph_compute_forces_mex.c` | 独立力计算 MEX（旧版，保留供参考） |
+| `build/` | MEX 编译输出目录（自动生成） |
 | `SPH_Poiseuille_result.png` | 模拟结果可视化 |
+| `CLAUDE.md` | 项目架构文档与开发指南 |
 
 ## 参考文献
 

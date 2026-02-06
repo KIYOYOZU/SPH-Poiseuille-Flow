@@ -1,50 +1,105 @@
 %% SPH_Poiseuille.m
-% SPH平板泊肃叶流动模拟程序 (向量化优化版)
-% 物理问题: 两平行板之间的压力驱动层流
-% 解析解: u(y) = (1/2μ) × |dp/dx| × y × (H - y)
-% 日期: 2026-02-06
+% SPH 平板泊肃叶流动模拟 (MEX C+OpenMP 加速版)
+% 解析解: u(y) = (1/2mu) * |dp/dx| * y * (H - y)
 
 clear; clc; close all;
 
-%% ========== 第1部分: 参数设置 ==========
-fprintf('=== SPH平板泊肃叶流动模拟 (向量化优化版) ===\n');
+%% MEX 自动编译
+mex_dir = fileparts(mfilename('fullpath'));
+mex_src_dir = fullfile(mex_dir, 'mex');
+build_dir = fullfile(mex_dir, 'build');
+use_mex_step = false;
+step_mex_name = 'sph_step_mex_v1';
 
-% 几何参数（参考 SPHinXsys channel_flow 配置）
-H = 1.0;            % 板间距 [m]
-L = 2.0;            % 计算域长度 [m] (x方向周期性)
+% 创建 build 目录
+if ~exist(build_dir, 'dir')
+    mkdir(build_dir);
+    fprintf('创建 build 目录: %s\n', build_dir);
+end
 
-% 粒子参数
-dx = 0.02;          % 粒子间距 [m]
-h = 1.3 * dx;       % 光滑长度 [m]
+% 添加 build 目录到 MATLAB 路径
+addpath(build_dir);
 
-% 流体物性（参考 config.ini: rho0=1.0 量级，调整 mu 使粘性时间尺度合理）
-rho0 = 1.0;         % 参考密度 [kg/m³]
-mu = 1.0;           % 动力粘度 [Pa·s]
-nu = mu / rho0;     % 运动粘度 [m²/s] = 1.0 → t_visc = H²/ν = 1s
+mex_sources = {
+    'sph_step_mex.c', step_mex_name, 'use_mex_step'
+};
+for m = 1:size(mex_sources, 1)
+    src = fullfile(mex_src_dir, mex_sources{m, 1});
+    mex_name = mex_sources{m, 2};
+    bin = fullfile(build_dir, [mex_name '.' mexext]);
+    if ~exist(src, 'file'), continue; end
+    need_compile = ~exist(bin, 'file');
+    if ~need_compile
+        d_src = dir(src); d_bin = dir(bin);
+        need_compile = d_src.datenum > d_bin.datenum;
+    end
+    if need_compile
+        fprintf('编译 %s -> %s ...\n', mex_sources{m, 1}, mex_name);
+        try
+            mex('-R2018a', '-O', 'COMPFLAGS="$COMPFLAGS /openmp"', ...
+                '-output', mex_name, '-outdir', build_dir, src);
+            fprintf('编译成功! 输出到: %s\n', build_dir);
+        catch e
+            fprintf('编译失败: %s\n', e.message);
+        end
+    end
+    if exist(bin, 'file'), eval([mex_sources{m, 3} ' = true;']); end
+end
 
-% 驱动力 (体积力形式，等效于压力梯度)
-dpdx = -8.0;        % 压力梯度 [Pa/m] → u_max = |dpdx|*H²/(8μ) = 1.0 m/s
-gx = -dpdx / rho0;  % 等效体积力 [m/s²]
+if strcmpi(strtrim(getenv('SPH_FORCE_MATLAB')), '1')
+    use_mex_step = false;
+    fprintf('检测到 SPH_FORCE_MATLAB=1，强制使用 MATLAB 回退实现。\n');
+end
 
-% 状态方程参数
-u_max_theory = (1/(2*mu)) * abs(dpdx) * (H/2)^2;  % 理论最大速度
-cs = 10 * max(u_max_theory, 1.0);  % 人工声速 [m/s]
+fprintf('MEX 加速: 融合单步=%s\n', mat2str(use_mex_step));
 
-% 时间参数（自适应时间步长，此处仅计算初始估计值）
+%% 参数设置
+fprintf('SPH 平板泊肃叶流动模拟\n');
+
+H = 1.0;            % 板间距
+L = 2.0;            % 计算域长度 (x方向周期性)
+dx = 0.02;          % 粒子间距
+h = 1.3 * dx;       % 光滑长度
+
+rho0 = 1.0;         % 参考密度
+mu = 1.0;           % 动力粘度
+nu = mu / rho0;
+
+dpdx = -8.0;        % 压力梯度 -> u_max = |dpdx|*H^2/(8*mu) = 1.0
+gx = -dpdx / rho0;
+
+u_max_theory = (1/(2*mu)) * abs(dpdx) * (H/2)^2;
+cs = 10 * max(u_max_theory, 1.0);
+
 dt_cfl = 0.25 * h / cs;
 dt_visc = 0.125 * h^2 / nu;
-dt = 0.5 * min(dt_cfl, dt_visc);     % 初始时间步长
-t_end = 5.0;                         % 总模拟时间 [s] (>3*t_visc 确保达到稳态)
+dt = 0.5 * min(dt_cfl, dt_visc);
+t_end = 5.0;
 
-% XSPH 参数
+env_t_end = str2double(strtrim(getenv('SPH_T_END')));
+if isfinite(env_t_end) && env_t_end > 0
+    t_end = env_t_end;
+end
+
 epsilon_xsph = 0.5;
 
-fprintf('理论最大速度 u_max = %.4f m/s\n', u_max_theory);
-fprintf('人工声速 cs = %.2f m/s\n', cs);
-fprintf('初始时间步长 dt = %.6f s (自适应)\n', dt);
-fprintf('模拟终止时间 t_end = %.1f s\n', t_end);
+enable_early_stop = true;
+if strcmpi(strtrim(getenv('SPH_EARLY_STOP')), '0')
+    enable_early_stop = false;
+end
 
-%% ========== 第2部分: 粒子初始化 ==========
+early_check_interval = 50;
+early_stable_hold = 8;
+early_min_time = 1.0;
+early_du_tol = 2e-4;
+early_profile_tol = 5e-4;
+
+fprintf('u_max_theory=%.4f, cs=%.2f, dt=%.6f, t_end=%.3f\n', ...
+    u_max_theory, cs, dt, t_end);
+fprintf('稳态提前停止=%s (du<%.1e, profile<%.1e, 连续%d次, t>=%.2fs)\n', ...
+    mat2str(enable_early_stop), early_du_tol, early_profile_tol, early_stable_hold, early_min_time);
+
+%% 粒子初始化
 fprintf('\n初始化粒子...\n');
 
 % 流体粒子
@@ -78,36 +133,61 @@ end
 x_b = [x_bottom; x_top];
 y_b = [y_bottom; y_top];
 n_boundary = length(x_b);
-n_bottom = n_layers * n_wall_per_layer;  % 下壁面粒子数
-n_top = n_layers * n_wall_per_layer;     % 上壁面粒子数
+n_bottom = n_layers * n_wall_per_layer;
+n_top = n_layers * n_wall_per_layer;
 
 % 合并所有粒子
 x = [x_f; x_b];
 y = [y_f; y_b];
 n_total = n_fluid + n_boundary;
 
-% 初始化速度和密度
 vx = zeros(n_total, 1);
 vy = zeros(n_total, 1);
 rho = rho0 * ones(n_total, 1);
-
-% 粒子质量
 mass = rho0 * dx^2;
 
 fprintf('流体粒子数: %d\n', n_fluid);
 fprintf('边界粒子数: %d\n', n_boundary);
 fprintf('总粒子数: %d\n', n_total);
 
-%% ========== 第3部分: 向量化核函数 ==========
-% Cubic Spline核函数 (2D) - 向量化版本
+%% 壁面速度预计算映射表
+fprintf('预计算壁面镜像映射表...\n');
+
+% 流体粒子的唯一y层（初始化时规则排列）
+y_fluid_init = y(1:n_fluid);
+y_layers = unique(round(y_fluid_init, 10));  % 唯一y层
+n_layers_fluid = length(y_layers);
+
+% 每个流体粒子属于哪一层
+[~, ~, fluid_layer_id] = unique(round(y_fluid_init, 10));
+
+% 每层粒子数（用于快速求层平均速度）
+layer_particle_count = accumarray(fluid_layer_id, 1, [n_layers_fluid, 1]);
+
+% 下壁面镜像y及插值权重
+idx_bottom = (n_fluid+1):(n_fluid+n_bottom);
+y_mirror_bottom = max(0, min(H, -y(idx_bottom)));
+[wall_bottom_k1, wall_bottom_k2, wall_bottom_w1, wall_bottom_w2] = ...
+    precompute_interp_weights(y_mirror_bottom, y_layers);
+
+% 上壁面镜像y及插值权重
+idx_top = (n_fluid+n_bottom+1):(n_fluid+n_bottom+n_top);
+y_mirror_top = max(0, min(H, 2*H - y(idx_top)));
+[wall_top_k1, wall_top_k2, wall_top_w1, wall_top_w2] = ...
+    precompute_interp_weights(y_mirror_top, y_layers);
+
+fprintf('壁面映射表预计算完成: %d 个流体层, %d 个壁面粒子\n', ...
+    n_layers_fluid, n_boundary);
+
+%% 核函数参数
 alpha_kernel = 10 / (7 * pi * h^2);  % 2D Cubic Spline 归一化系数
 r_cut = 2 * h;
 
-%% ========== 第4部分: SPH主循环 (Cell-Linked List + Velocity Verlet) ==========
+%% SPH主循环 (Cell-Linked List + Velocity Verlet)
 fprintf('\n开始SPH计算...\n');
 progress_bar_width = 50;
 
-% 记录历史（预分配，动态扩展）
+% 历史记录（预分配）
 max_history = 5000;
 time_history = zeros(max_history, 1);
 u_max_history = zeros(max_history, 1);
@@ -144,27 +224,33 @@ r_pair_buf = zeros(max_pairs, 1);
 vx_xsph = zeros(n_total, 1);
 vy_xsph = zeros(n_total, 1);
 
-% ============================================================
 % 初始力计算（Velocity Verlet 需要初始加速度）
-% ============================================================
 fprintf('计算初始加速度...\n');
 
 % 镜像速度边界条件（初始速度为零，此处主要为完整性）
-vx = update_wall_velocity(vx, vy, y, n_fluid, n_bottom, n_top, H);
+vx = update_wall_velocity_fast(vx, n_fluid, n_bottom, n_top, ...
+    fluid_layer_id, layer_particle_count, n_layers_fluid, ...
+    wall_bottom_k1, wall_bottom_k2, wall_bottom_w1, wall_bottom_w2, ...
+    wall_top_k1, wall_top_k2, wall_top_w1, wall_top_w2);
 
-[pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs] = ...
-    cell_linked_list_search(x, y, n_total, L, r_cut, ...
-    y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, ...
-    n_cells, stencil, pair_i_buf, pair_j_buf, dx_pair_buf, dy_pair_buf, r_pair_buf);
+if use_mex_step
+    [ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs] = ...
+        feval(step_mex_name, x, y, vx, vy, n_total, n_fluid, L, r_cut, ...
+        y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, n_cells, ...
+        h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, 0);
+else
+    [pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs] = ...
+        cell_linked_list_search(x, y, n_total, L, r_cut, ...
+        y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, ...
+        n_cells, stencil, pair_i_buf, pair_j_buf, dx_pair_buf, dy_pair_buf, r_pair_buf);
 
-[ax, ay, rho, p, ~, ~, ~, vx_xsph, vy_xsph] = ...
-    sph_compute_forces(pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs, ...
-    x, y, vx, vy, n_total, n_fluid, h, alpha_kernel, W_self, mass, ...
-    cs, rho0, mu, gx, epsilon_xsph, false);
+    [ax, ay, rho, p, ~, ~, ~, vx_xsph, vy_xsph] = ...
+        sph_compute_forces(pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs, ...
+        x, y, vx, vy, n_total, n_fluid, h, alpha_kernel, W_self, mass, ...
+        cs, rho0, mu, gx, epsilon_xsph, false);
+end
 
 % 用初始 SPH 密度修正质量（消除核函数离散求和的系统偏差）
-% 原理：rho_sph = mass * Σ W_ij ≈ f * rho0 (f<1)
-% 修正：mass_new = mass * rho0/rho_sph，使得 rho_sph_new = rho0
 rho0_sph = mean(rho(1:n_fluid));
 fprintf('SPH 初始密度: mean=%.4f, min=%.4f, max=%.4f (理论 rho0=%.1f)\n', ...
     rho0_sph, min(rho(1:n_fluid)), max(rho(1:n_fluid)), rho0);
@@ -173,68 +259,123 @@ mass = mass * mass_correction;
 fprintf('质量修正因子: %.4f, 修正后 mass=%.6e\n', mass_correction, mass);
 
 % 重新计算初始力（使用修正后的 mass）
-[ax, ay, rho, p, ~, ~, ~, vx_xsph, vy_xsph] = ...
-    sph_compute_forces(pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs, ...
-    x, y, vx, vy, n_total, n_fluid, h, alpha_kernel, W_self, mass, ...
-    cs, rho0, mu, gx, epsilon_xsph, false);
+if use_mex_step
+    [ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs] = ...
+        feval(step_mex_name, x, y, vx, vy, n_total, n_fluid, L, r_cut, ...
+        y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, n_cells, ...
+        h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, 0);
+else
+    [ax, ay, rho, p, ~, ~, ~, vx_xsph, vy_xsph] = ...
+        sph_compute_forces(pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs, ...
+        x, y, vx, vy, n_total, n_fluid, h, alpha_kernel, W_self, mass, ...
+        cs, rho0, mu, gx, epsilon_xsph, false);
+end
 fprintf('修正后 SPH 密度: mean=%.4f\n', mean(rho(1:n_fluid)));
 
 fprintf('初始邻居对数: %d (平均每粒子 %.1f 个邻居)\n', n_pairs, 2*n_pairs/n_total);
 
-% ============================================================
-% 主循环（Velocity Verlet + 自适应时间步长）
-% ============================================================
+% 稳态提前停止状态
+profile_n_bins = 40;
+profile_y_bins = linspace(0, H, profile_n_bins+1);
+prev_check_u_max = NaN;
+prev_check_profile = zeros(profile_n_bins, 1);
+prev_check_valid = false;
+stable_hit_count = 0;
+early_stop_triggered = false;
+early_stop_msg = '';
+
+%% 主循环（Velocity Verlet + 自适应时间步长）
 tic;
 t_current = 0;
 step = 0;
-last_display_time = -1;  % 用于控制显示频率
+last_display_time = -1;
 
 while t_current < t_end
     step = step + 1;
 
     % --- 自适应时间步长 ---
-    v_max = max(sqrt(vx(1:n_fluid).^2 + vy(1:n_fluid).^2));  % 只计算流体粒子
+    v_sq = vx(1:n_fluid).^2 + vy(1:n_fluid).^2;
+    v_max = sqrt(max(v_sq));
     dt_cfl = 0.25 * h / (cs + v_max);
     dt = 0.5 * min(dt_cfl, dt_visc);
-    dt = min(dt, t_end - t_current);  % 不超过终止时间
+    dt = min(dt, t_end - t_current);
 
-    % --- Velocity Verlet 第1步：半步速度 ---
+    % --- Verlet 半步速度 ---
     vx(1:n_fluid) = vx(1:n_fluid) + 0.5 * ax(1:n_fluid) * dt;
     vy(1:n_fluid) = vy(1:n_fluid) + 0.5 * ay(1:n_fluid) * dt;
 
-    % --- 全步位置（含 XSPH 修正，使用上一步邻居数据）---
+    % --- 全步位置 + XSPH 修正 ---
     x(1:n_fluid) = x(1:n_fluid) + (vx(1:n_fluid) + epsilon_xsph*vx_xsph(1:n_fluid)) * dt;
     y(1:n_fluid) = y(1:n_fluid) + (vy(1:n_fluid) + epsilon_xsph*vy_xsph(1:n_fluid)) * dt;
 
-    % --- 周期性边界处理 ---
+    % --- 周期性边界 ---
     x(1:n_fluid) = mod(x(1:n_fluid), L);
 
-    % --- 镜像速度边界条件（在力计算前更新壁面粒子速度）---
-    vx = update_wall_velocity(vx, vy, y, n_fluid, n_bottom, n_top, H);
+    % --- 壁面镜像速度 ---
+    vx = update_wall_velocity_fast(vx, n_fluid, n_bottom, n_top, ...
+        fluid_layer_id, layer_particle_count, n_layers_fluid, ...
+        wall_bottom_k1, wall_bottom_k2, wall_bottom_w1, wall_bottom_w2, ...
+        wall_top_k1, wall_top_k2, wall_top_w1, wall_top_w2);
 
-    % --- Cell-Linked List 邻居搜索 ---
-    [pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs] = ...
-        cell_linked_list_search(x, y, n_total, L, r_cut, ...
-        y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, ...
-        n_cells, stencil, pair_i_buf, pair_j_buf, dx_pair_buf, dy_pair_buf, r_pair_buf);
-
-    % --- SPH 力计算（含 Shepard 修正每30步）---
+    % --- SPH 单步计算（融合 MEX 或 MATLAB 回退） ---
     do_shepard = (mod(step, 30) == 0);
-    [ax, ay, rho, p, ~, ~, ~, vx_xsph, vy_xsph] = ...
-        sph_compute_forces(pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs, ...
-        x, y, vx, vy, n_total, n_fluid, h, alpha_kernel, W_self, mass, ...
-        cs, rho0, mu, gx, epsilon_xsph, do_shepard);
+    if use_mex_step
+        [ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs] = ...
+            feval(step_mex_name, x, y, vx, vy, n_total, n_fluid, L, r_cut, ...
+            y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, n_cells, ...
+            h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, double(do_shepard));
+    else
+        [pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs] = ...
+            cell_linked_list_search(x, y, n_total, L, r_cut, ...
+            y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, ...
+            n_cells, stencil, pair_i_buf, pair_j_buf, dx_pair_buf, dy_pair_buf, r_pair_buf);
 
-    % --- Velocity Verlet 第2步：半步速度 ---
+        [ax, ay, rho, p, ~, ~, ~, vx_xsph, vy_xsph] = ...
+            sph_compute_forces(pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs, ...
+            x, y, vx, vy, n_total, n_fluid, h, alpha_kernel, W_self, mass, ...
+            cs, rho0, mu, gx, epsilon_xsph, do_shepard);
+    end
+
+    % --- Verlet 完成速度 ---
     vx(1:n_fluid) = vx(1:n_fluid) + 0.5 * ax(1:n_fluid) * dt;
     vy(1:n_fluid) = vy(1:n_fluid) + 0.5 * ay(1:n_fluid) * dt;
 
     t_current = t_current + dt;
 
-    % --- 进度显示（基于时间间隔，约每0.15s模拟时间更新一次）---
+    u_max_current = max(vx(1:n_fluid));
+
+    % --- 稳态提前停止检查 ---
+    if enable_early_stop && t_current >= early_min_time && mod(step, early_check_interval) == 0
+        current_profile = compute_binned_profile_mean(y(1:n_fluid), vx(1:n_fluid), profile_y_bins);
+
+        if prev_check_valid
+            du_rel = abs(u_max_current - prev_check_u_max) / max(abs(u_max_current), 1e-12);
+            profile_rel = norm(current_profile - prev_check_profile, 2) / ...
+                max(norm(current_profile, 2), 1e-12);
+
+            if du_rel < early_du_tol && profile_rel < early_profile_tol
+                stable_hit_count = stable_hit_count + 1;
+            else
+                stable_hit_count = 0;
+            end
+
+            if stable_hit_count >= early_stable_hold
+                early_stop_triggered = true;
+                early_stop_msg = sprintf('触发稳态提前停止: t=%.3fs, du=%.2e, profile=%.2e, 连续%d次', ...
+                    t_current, du_rel, profile_rel, stable_hit_count);
+                fprintf('\n%s\n', early_stop_msg);
+                break;
+            end
+        end
+
+        prev_check_u_max = u_max_current;
+        prev_check_profile = current_profile;
+        prev_check_valid = true;
+    end
+
+    % --- 进度显示 ---
     if t_current - last_display_time >= t_end/100 || t_current >= t_end
         last_display_time = t_current;
-        u_max_current = max(vx(1:n_fluid));
 
         % 记录历史
         history_idx = history_idx + 1;
@@ -264,23 +405,37 @@ end
 elapsed_time = toc;
 fprintf('\n\n计算完成! 耗时: %.2f 秒\n', elapsed_time);
 
+if early_stop_triggered
+    fprintf('%s\n', early_stop_msg);
+end
+
+if history_idx == 0 || time_history(history_idx) < t_current
+    history_idx = history_idx + 1;
+    if history_idx > max_history
+        max_history = max_history * 2;
+        time_history(end+1:max_history) = 0;
+        u_max_history(end+1:max_history) = 0;
+    end
+    time_history(history_idx) = t_current;
+    u_max_history(history_idx) = max(vx(1:n_fluid));
+end
+
 % 截断历史数组
 time_history = time_history(1:history_idx);
 u_max_history = u_max_history(1:history_idx);
 
-%% ========== 第5部分: 后处理与验证 ==========
-fprintf('\n=== 后处理与验证 ===\n');
+%% 后处理与验证
+fprintf('\n后处理与验证\n');
 
-% 提取流体粒子数据
 x_final = x(1:n_fluid);
 y_final = y(1:n_fluid);
 vx_final = vx(1:n_fluid);
 
-% 计算解析解
+% 解析解
 y_analytical = linspace(0, H, 100);
 u_analytical = (1/(2*mu)) * abs(dpdx) * y_analytical .* (H - y_analytical);
 
-% 计算SPH平均速度剖面
+% SPH 平均速度剖面
 n_bins = 40;
 y_bins = linspace(0, H, n_bins+1);
 y_centers = (y_bins(1:end-1) + y_bins(2:end)) / 2;
@@ -295,10 +450,10 @@ for i = 1:n_bins
     end
 end
 
-% 解析解在bin中心
+% 解析解在 bin 中心
 u_analytical_bins = (1/(2*mu)) * abs(dpdx) * y_centers .* (H - y_centers);
 
-% L2误差
+% L2 误差
 valid_bins = u_sph > 0;
 L2_error = sqrt(mean((u_sph(valid_bins) - u_analytical_bins(valid_bins)').^2)) / max(u_analytical_bins);
 fprintf('L2相对误差: %.2f%%\n', L2_error * 100);
@@ -348,7 +503,7 @@ saveas(gcf, 'SPH_Poiseuille_result.png');
 fprintf('结果图片已保存: SPH_Poiseuille_result.png\n');
 
 %% 输出验证结果
-fprintf('\n=== 验证总结 ===\n');
+fprintf('\n验证总结\n');
 fprintf('理论最大速度: %.4f m/s\n', u_max_theory);
 fprintf('SPH最大速度:  %.4f m/s\n', max(vx_final));
 fprintf('相对偏差:     %.2f%%\n', abs(max(vx_final) - u_max_theory) / u_max_theory * 100);
@@ -362,22 +517,19 @@ end
 
 fprintf('\n程序运行完毕!\n');
 
-%% ========== Local Functions (MATLAB R2016b+ 脚本支持) ==========
+%% Local Functions
 
 function [pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs] = ...
         cell_linked_list_search(x, y, n_total, L, r_cut, ...
         y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, ...
         n_cells, stencil, pair_i_buf, pair_j_buf, dx_pair_buf, dy_pair_buf, r_pair_buf)
-% Cell-Linked List 邻居搜索
-% 输入: 粒子位置、网格参数、预分配缓冲区
-% 输出: 邻居对列表 (pair_i, pair_j) 及其距离信息
+% Cell-Linked List 邻居搜索（半模板遍历）
 
-    % 粒子→单元映射
+    % 粒子→单元映射 + 排序构建索引
     cell_ix = min(max(floor(mod(x, L) / cell_size_x) + 1, 1), n_cell_x);
     cell_iy = min(max(floor((y - y_min_domain) / cell_size_y) + 1, 1), n_cell_y);
     cell_id = (cell_iy - 1) * n_cell_x + cell_ix;
 
-    % 排序法构建单元索引
     [cell_id_sorted, sort_idx] = sort(cell_id);
     particle_sorted = sort_idx;
     cell_start = zeros(n_cells, 1);
@@ -389,7 +541,7 @@ function [pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs] = ...
         cell_end(cid) = changes(kk+1) - 1;
     end
 
-    % 遍历单元对，构建邻居列表
+    % 遍历单元对
     n_pairs = 0;
     r_cut_sq = r_cut^2;
 
@@ -406,17 +558,13 @@ function [pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs] = ...
                 if ncy < 1 || ncy > n_cell_y, continue; end
 
                 % x方向周期性 wrap
-                % ncx<1: pi在左边界(cx=1), pj在右边界(wrap后ncx=n_cell_x)
-                %   真实距离 = x(pi) - (x(pj) - L) = x(pi) - x(pj) + L
-                % ncx>n_cell_x: pi在右边界, pj在左边界(wrap后ncx=1)
-                %   真实距离 = x(pi) - (x(pj) + L) = x(pi) - x(pj) - L
                 x_shift = 0;
                 if ncx < 1
                     ncx = ncx + n_cell_x;
-                    x_shift = L;   % pi在左, pj在右(wrap), 加L修正
+                    x_shift = L;
                 elseif ncx > n_cell_x
                     ncx = ncx - n_cell_x;
-                    x_shift = -L;  % pi在右, pj在左(wrap), 减L修正
+                    x_shift = -L;
                 end
 
                 cid2 = (ncy-1)*n_cell_x + ncx;
@@ -536,28 +684,22 @@ function [ax, ay, rho, p_out, W_pair, rho_i, rho_j, vx_xsph_out, vy_xsph_out] = 
 end
 
 function vx = update_wall_velocity(vx, vy, y, n_fluid, n_bottom, n_top, H)
-% 镜像速度边界条件（向量化版本）
-% 壁面虚粒子速度 = -u_fluid(y_mirror)
-% 下壁面: y_wall < 0, 镜像点 y_mirror = -y_wall
-% 上壁面: y_wall > H, 镜像点 y_mirror = 2H - y_wall
-% 对每个壁面粒子，找y坐标最接近镜像点的流体粒子
+% 镜像速度边界条件: 壁面虚粒子速度 = -u_fluid(y_mirror)
 
     y_fluid = y(1:n_fluid);
     vx_fluid = vx(1:n_fluid);
 
-    % 下壁面粒子 (索引 n_fluid+1 到 n_fluid+n_bottom)
+    % 下壁面
     idx_bottom = (n_fluid+1):(n_fluid+n_bottom);
-    y_mirror_bottom = -y(idx_bottom);  % 镜像到流体域内
+    y_mirror_bottom = -y(idx_bottom);
     y_mirror_bottom = max(0, min(H, y_mirror_bottom));
 
-    % 上壁面粒子 (索引 n_fluid+n_bottom+1 到 n_fluid+n_bottom+n_top)
+    % 上壁面
     idx_top = (n_fluid+n_bottom+1):(n_fluid+n_bottom+n_top);
     y_mirror_top = 2*H - y(idx_top);
     y_mirror_top = max(0, min(H, y_mirror_top));
 
-    % 对所有壁面粒子，找最近流体粒子（利用 y_fluid 排序加速）
-    % 由于粒子在y方向规则排列，可以用 interp1 插值代替最近邻搜索
-    % 先获取每个y层的平均速度
+    % 用 interp1 插值获取镜像点速度
     [y_sorted, sort_idx] = sort(y_fluid);
     vx_sorted = vx_fluid(sort_idx);
 
@@ -571,4 +713,71 @@ function vx = update_wall_velocity(vx, vy, y, n_fluid, n_bottom, n_top, H)
 
     vx_mirror_top = interp1(y_unique, vx_unique, y_mirror_top, 'linear', 'extrap');
     vx(idx_top) = -vx_mirror_top;
+end
+
+function [k1, k2, w1, w2] = precompute_interp_weights(y_query, y_layers)
+% 预计算线性插值的索引和权重: w1*v(k1) + w2*v(k2)
+
+    n_q = length(y_query);
+    n_layers = length(y_layers);
+    k1 = ones(n_q, 1);
+    k2 = ones(n_q, 1);
+    w1 = ones(n_q, 1);
+    w2 = zeros(n_q, 1);
+
+    for i = 1:n_q
+        yq = y_query(i);
+        if yq <= y_layers(1)
+            k1(i) = 1; k2(i) = 1; w1(i) = 1; w2(i) = 0;
+        elseif yq >= y_layers(end)
+            k1(i) = n_layers; k2(i) = n_layers; w1(i) = 1; w2(i) = 0;
+        else
+            idx = find(y_layers <= yq, 1, 'last');
+            if idx >= n_layers
+                idx = n_layers - 1;
+            end
+            k1(i) = idx;
+            k2(i) = idx + 1;
+            frac = (yq - y_layers(idx)) / (y_layers(idx+1) - y_layers(idx));
+            w1(i) = 1 - frac;
+            w2(i) = frac;
+        end
+    end
+end
+
+function vx = update_wall_velocity_fast(vx, n_fluid, n_bottom, n_top, ...
+    fluid_layer_id, layer_particle_count, n_layers_fluid, ...
+    wall_bottom_k1, wall_bottom_k2, wall_bottom_w1, wall_bottom_w2, ...
+    wall_top_k1, wall_top_k2, wall_top_w1, wall_top_w2)
+% 快速壁面速度更新（预计算映射表，无 sort/unique/interp1）
+
+    vx_fluid = vx(1:n_fluid);
+    vx_layer_sum = accumarray(fluid_layer_id, vx_fluid, [n_layers_fluid, 1]);
+    vx_layer = vx_layer_sum ./ layer_particle_count;
+
+    % 下壁面
+    idx_bottom = (n_fluid+1):(n_fluid+n_bottom);
+    vx_mirror = wall_bottom_w1 .* vx_layer(wall_bottom_k1) + ...
+                wall_bottom_w2 .* vx_layer(wall_bottom_k2);
+    vx(idx_bottom) = -vx_mirror;
+
+    % 上壁面
+    idx_top = (n_fluid+n_bottom+1):(n_fluid+n_bottom+n_top);
+    vx_mirror = wall_top_w1 .* vx_layer(wall_top_k1) + ...
+                wall_top_w2 .* vx_layer(wall_top_k2);
+    vx(idx_top) = -vx_mirror;
+end
+
+function profile_mean = compute_binned_profile_mean(y_values, u_values, y_edges)
+% 计算分箱平均速度剖面（用于稳态判据）
+
+    n_bins = length(y_edges) - 1;
+    bin_width = y_edges(2) - y_edges(1);
+    bin_idx = floor((y_values - y_edges(1)) / bin_width) + 1;
+    bin_idx(bin_idx < 1) = 1;
+    bin_idx(bin_idx > n_bins) = n_bins;
+
+    u_sum = accumarray(bin_idx, u_values, [n_bins, 1], @sum, 0);
+    u_count = accumarray(bin_idx, 1, [n_bins, 1], @sum, 0);
+    profile_mean = u_sum ./ max(u_count, 1);
 end

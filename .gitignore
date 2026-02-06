@@ -1,0 +1,25 @@
+# 编译输出目录
+build/
+
+# 编译临时文件
+*.o
+*.obj
+
+# IDE 配置
+.vscode/
+.idea/
+*.code-workspace
+
+# 临时文件
+*.asv
+*.patch
+tmp.*
+
+# 文档草稿
+AGENTS.md
+CLAUDE.md
+
+# MATLAB 自动生成
+*.autosave
+slprj/
+
