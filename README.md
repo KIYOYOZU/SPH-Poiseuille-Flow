@@ -103,7 +103,6 @@ Remove-Item Env:SPH_T_END
 | `mex/sph_compute_forces_mex.c` | 独立力计算 MEX（旧版，保留供参考） |
 | `build/` | MEX 编译输出目录（自动生成） |
 | `SPH_Poiseuille_result.png` | 模拟结果可视化 |
-| `CLAUDE.md` | 项目架构文档与开发指南 |
 
 ## 参考文献
 
