@@ -99,6 +99,26 @@ fprintf('u_max_theory=%.4f, cs=%.2f, dt=%.6f, t_end=%.3f\n', ...
 fprintf('稳态提前停止=%s (du<%.1e, profile<%.1e, 连续%d次, t>=%.2fs)\n', ...
     mat2str(enable_early_stop), early_du_tol, early_profile_tol, early_stable_hold, early_min_time);
 
+% 壁面边界条件类型: 'dirichlet' | 'neumann_laminar' | 'neumann_wallmodel'
+wall_bc_type = 'neumann_laminar';
+env_wall_bc = strtrim(getenv('SPH_WALL_BC'));
+if ~isempty(env_wall_bc)
+    valid_bc_types = {'dirichlet', 'neumann_laminar', 'neumann_wallmodel'};
+    if ismember(env_wall_bc, valid_bc_types)
+        wall_bc_type = env_wall_bc;
+    else
+        warning('无效的 SPH_WALL_BC="%s"，使用默认 dirichlet', env_wall_bc);
+    end
+end
+
+% 壁面模型参数（仅 neumann_wallmodel 使用）
+wm_kappa = 0.41;       % von Kármán 常数
+wm_E = 9.8;            % 对数律常数
+wm_max_iter = 20;      % 最大迭代次数
+wm_tol = 1e-6;         % 收敛容差
+
+fprintf('壁面边界条件: %s\n', wall_bc_type);
+
 %% 粒子初始化
 fprintf('\n初始化粒子...\n');
 
@@ -179,6 +199,12 @@ y_mirror_top = max(0, min(H, 2*H - y(idx_top)));
 fprintf('壁面映射表预计算完成: %d 个流体层, %d 个壁面粒子\n', ...
     n_layers_fluid, n_boundary);
 
+% Neumann BC 预计算：虚粒子到壁面距离 & 近壁流体层信息
+d_bottom = abs(y(idx_bottom));          % 下壁面虚粒子到 y=0 的距离
+d_top    = abs(y(idx_top) - H);         % 上壁面虚粒子到 y=H 的距离
+y_layer1_bottom = y_layers(1);          % 近壁第1层 y 坐标（下壁面）
+y_layer1_top    = H - y_layers(end);    % 近壁第1层到上壁面的距离
+
 %% 核函数参数
 alpha_kernel = 10 / (7 * pi * h^2);  % 2D Cubic Spline 归一化系数
 r_cut = 2 * h;
@@ -227,11 +253,13 @@ vy_xsph = zeros(n_total, 1);
 % 初始力计算（Velocity Verlet 需要初始加速度）
 fprintf('计算初始加速度...\n');
 
-% 镜像速度边界条件（初始速度为零，此处主要为完整性）
-vx = update_wall_velocity_fast(vx, n_fluid, n_bottom, n_top, ...
+% 壁面速度边界条件（初始速度为零，此处主要为完整性）
+vx = update_wall_velocity_unified(vx, n_fluid, n_bottom, n_top, ...
     fluid_layer_id, layer_particle_count, n_layers_fluid, ...
     wall_bottom_k1, wall_bottom_k2, wall_bottom_w1, wall_bottom_w2, ...
-    wall_top_k1, wall_top_k2, wall_top_w1, wall_top_w2);
+    wall_top_k1, wall_top_k2, wall_top_w1, wall_top_w2, ...
+    wall_bc_type, d_bottom, d_top, y_layer1_bottom, y_layer1_top, ...
+    H, mu, rho0, wm_kappa, wm_E, wm_max_iter, wm_tol);
 
 if use_mex_step
     [ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs] = ...
@@ -311,11 +339,13 @@ while t_current < t_end
     % --- 周期性边界 ---
     x(1:n_fluid) = mod(x(1:n_fluid), L);
 
-    % --- 壁面镜像速度 ---
-    vx = update_wall_velocity_fast(vx, n_fluid, n_bottom, n_top, ...
+    % --- 壁面速度边界条件 ---
+    vx = update_wall_velocity_unified(vx, n_fluid, n_bottom, n_top, ...
         fluid_layer_id, layer_particle_count, n_layers_fluid, ...
         wall_bottom_k1, wall_bottom_k2, wall_bottom_w1, wall_bottom_w2, ...
-        wall_top_k1, wall_top_k2, wall_top_w1, wall_top_w2);
+        wall_top_k1, wall_top_k2, wall_top_w1, wall_top_w2, ...
+        wall_bc_type, d_bottom, d_top, y_layer1_bottom, y_layer1_top, ...
+        H, mu, rho0, wm_kappa, wm_E, wm_max_iter, wm_tol);
 
     % --- SPH 单步计算（融合 MEX 或 MATLAB 回退） ---
     do_shepard = (mod(step, 30) == 0);
@@ -780,4 +810,117 @@ function profile_mean = compute_binned_profile_mean(y_values, u_values, y_edges)
     u_sum = accumarray(bin_idx, u_values, [n_bins, 1], @sum, 0);
     u_count = accumarray(bin_idx, 1, [n_bins, 1], @sum, 0);
     profile_mean = u_sum ./ max(u_count, 1);
+end
+
+function vx = update_wall_velocity_unified(vx, n_fluid, n_bottom, n_top, ...
+    fluid_layer_id, layer_particle_count, n_layers_fluid, ...
+    wall_bottom_k1, wall_bottom_k2, wall_bottom_w1, wall_bottom_w2, ...
+    wall_top_k1, wall_top_k2, wall_top_w1, wall_top_w2, ...
+    wall_bc_type, d_bottom, d_top, y_layer1_bottom, y_layer1_top, ...
+    H, mu, rho0, wm_kappa, wm_E, wm_max_iter, wm_tol)
+% 统一壁面速度更新函数
+% 支持三种模式: dirichlet / neumann_laminar / neumann_wallmodel
+
+    % 计算各层平均速度（所有模式共用）
+    vx_fluid = vx(1:n_fluid);
+    vx_layer_sum = accumarray(fluid_layer_id, vx_fluid, [n_layers_fluid, 1]);
+    vx_layer = vx_layer_sum ./ layer_particle_count;
+
+    % 壁面粒子索引
+    idx_bottom = (n_fluid+1):(n_fluid+n_bottom);
+    idx_top = (n_fluid+n_bottom+1):(n_fluid+n_bottom+n_top);
+
+    % 镜像点速度插值（所有模式共用）
+    vx_mirror_bottom = wall_bottom_w1 .* vx_layer(wall_bottom_k1) + ...
+                       wall_bottom_w2 .* vx_layer(wall_bottom_k2);
+    vx_mirror_top = wall_top_w1 .* vx_layer(wall_top_k1) + ...
+                    wall_top_w2 .* vx_layer(wall_top_k2);
+
+    switch wall_bc_type
+        case 'dirichlet'
+            % Morris (1997) 镜像速度法: u_ghost = -u_mirror
+            vx(idx_bottom) = -vx_mirror_bottom;
+            vx(idx_top)    = -vx_mirror_top;
+
+        case 'neumann_laminar'
+            % 层流 Neumann BC: 近壁单点差分估计 du/dy
+            u_layer1_bottom = vx_layer(1);      % 近壁第1层速度（下壁面）
+            u_layer1_top    = vx_layer(end);     % 近壁第1层速度（上壁面）
+
+            % du/dy 带符号: 下壁面 > 0, 上壁面 < 0
+            dudy_bottom = u_layer1_bottom / y_layer1_bottom;
+            dudy_top    = -u_layer1_top / y_layer1_top;
+
+            % u_ghost = u_wall - d * (du/dy), u_wall = 0
+            % 下壁面虚粒子在 y=-d: u(-d) = 0 + (-d)*dudy = -d*dudy
+            % 上壁面虚粒子在 y=H+d: u(H+d) = 0 + d*dudy = d*dudy (dudy<0, 所以u_ghost<0)
+            vx(idx_bottom) = -d_bottom .* dudy_bottom;
+            vx(idx_top)    =  d_top    .* dudy_top;
+
+        case 'neumann_wallmodel'
+            % 壁面模型 Neumann BC: 对数律不动点迭代
+            u_layer1_bottom = vx_layer(1);
+            u_layer1_top    = vx_layer(end);
+            nu = mu / rho0;
+
+            % 下壁面: du/dy > 0
+            abs_dudy_bottom = wall_model_dudy(abs(u_layer1_bottom), ...
+                y_layer1_bottom, nu, mu, rho0, wm_kappa, wm_E, wm_max_iter, wm_tol);
+            dudy_bottom = +abs_dudy_bottom;
+
+            % 上壁面: du/dy < 0
+            abs_dudy_top = wall_model_dudy(abs(u_layer1_top), ...
+                y_layer1_top, nu, mu, rho0, wm_kappa, wm_E, wm_max_iter, wm_tol);
+            dudy_top = -abs_dudy_top;
+
+            % u_ghost = u_wall + (±d) * (du/dy), u_wall = 0
+            vx(idx_bottom) = -d_bottom .* dudy_bottom;
+            vx(idx_top)    =  d_top    .* dudy_top;
+
+        otherwise
+            error('未知的壁面边界条件类型: %s', wall_bc_type);
+    end
+end
+
+function abs_dudy = wall_model_dudy(u_ref, y_ref, nu, mu, rho0, ...
+    kappa, E, max_iter, tol)
+% 对数律壁面模型: 不动点迭代求 |du/dy|_wall
+% 输入: u_ref - 参考点速度绝对值
+%        y_ref - 参考点到壁面距离
+%        nu    - 运动粘度
+%        mu    - 动力粘度
+%        rho0  - 参考密度
+%        kappa - von Kármán 常数 (0.41)
+%        E     - 对数律常数 (9.8)
+% 输出: abs_dudy - |du/dy|_wall 的绝对值
+
+    if u_ref < 1e-15 || y_ref < 1e-15
+        abs_dudy = 0;
+        return;
+    end
+
+    % 初始猜测: 粘性子层公式 u+ = y+ → u_tau = sqrt(nu * u_ref / y_ref)
+    u_tau = sqrt(nu * u_ref / y_ref);
+
+    for iter = 1:max_iter
+        u_tau_old = u_tau;
+        y_plus = u_tau * y_ref / nu;
+
+        if y_plus <= 11.1
+            % 粘性子层: u+ = y+ → u_tau = sqrt(nu * u_ref / y_ref)
+            u_tau = sqrt(nu * u_ref / y_ref);
+        else
+            % 对数层: u+ = (1/κ) * ln(E * y+)
+            u_tau = u_ref * kappa / log(E * y_plus);
+        end
+
+        % 收敛检查
+        if abs(u_tau - u_tau_old) / max(u_tau, 1e-15) < tol
+            break;
+        end
+    end
+
+    % τ_w = ρ * u_τ², |du/dy|_wall = τ_w / μ
+    tau_w = rho0 * u_tau^2;
+    abs_dudy = tau_w / mu;
 end

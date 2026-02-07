@@ -23,3 +23,5 @@ CLAUDE.md
 *.autosave
 slprj/
 
+.claude/settings.local.json
+壁面边界条件报告.md
