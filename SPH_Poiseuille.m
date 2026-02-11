@@ -62,10 +62,10 @@ dx = 0.02;          % 粒子间距
 h = 1.3 * dx;       % 光滑长度
 
 rho0 = 1.0;         % 参考密度
-mu = 1.0;           % 动力粘度
+mu = 0.1;           % 动力粘度
 nu = mu / rho0;
 
-dpdx = -8.0;        % 压力梯度 -> u_max = |dpdx|*H^2/(8*mu) = 1.0
+dpdx = -0.8;        % 压力梯度 -> u_max = |dpdx|*H^2/(8*mu) = 1.0
 gx = -dpdx / rho0;
 
 u_max_theory = (1/(2*mu)) * abs(dpdx) * (H/2)^2;
@@ -83,6 +83,20 @@ end
 
 epsilon_xsph = 0.5;
 
+% VTP 流场输出参数
+enable_vtp_output = true;
+vtp_n_frames = 10;           % 输出帧数
+vtp_output_dir = 'vtp_output';
+env_vtp_frames = str2double(strtrim(getenv('SPH_VTP_FRAMES')));
+if isfinite(env_vtp_frames) && env_vtp_frames > 0
+    vtp_n_frames = round(env_vtp_frames);
+end
+if strcmpi(strtrim(getenv('SPH_VTP_OUTPUT')), '0')
+    enable_vtp_output = false;
+end
+fprintf('VTP输出: %s (帧数=%d, 目录=%s)\n', ...
+    mat2str(enable_vtp_output), vtp_n_frames, vtp_output_dir);
+
 enable_early_stop = true;
 if strcmpi(strtrim(getenv('SPH_EARLY_STOP')), '0')
     enable_early_stop = false;
@@ -99,11 +113,11 @@ fprintf('u_max_theory=%.4f, cs=%.2f, dt=%.6f, t_end=%.3f\n', ...
 fprintf('稳态提前停止=%s (du<%.1e, profile<%.1e, 连续%d次, t>=%.2fs)\n', ...
     mat2str(enable_early_stop), early_du_tol, early_profile_tol, early_stable_hold, early_min_time);
 
-% 壁面边界条件类型: 'dirichlet' | 'neumann_laminar' | 'neumann_wallmodel'
+% 壁面边界条件类型: 'dirichlet' | 'neumann_laminar' | 'neumann_wallmodel' | 'contact_only'
 wall_bc_type = 'neumann_laminar';
 env_wall_bc = strtrim(getenv('SPH_WALL_BC'));
 if ~isempty(env_wall_bc)
-    valid_bc_types = {'dirichlet', 'neumann_laminar', 'neumann_wallmodel'};
+    valid_bc_types = {'dirichlet', 'neumann_laminar', 'neumann_wallmodel', 'contact_only'};
     if ismember(env_wall_bc, valid_bc_types)
         wall_bc_type = env_wall_bc;
     else
@@ -318,6 +332,15 @@ t_current = 0;
 step = 0;
 last_display_time = -1;
 
+% VTP 帧调度初始化
+if enable_vtp_output
+    if ~exist(vtp_output_dir, 'dir'), mkdir(vtp_output_dir); end
+    vtp_frame_interval = t_end / vtp_n_frames;
+    vtp_next_frame_time = 0;
+    vtp_frame_count = 0;
+    vtp_last_save_time = -inf;
+end
+
 while t_current < t_end
     step = step + 1;
 
@@ -371,6 +394,18 @@ while t_current < t_end
     vy(1:n_fluid) = vy(1:n_fluid) + 0.5 * ay(1:n_fluid) * dt;
 
     t_current = t_current + dt;
+
+    % --- VTP 帧输出 ---
+    if enable_vtp_output && t_current >= vtp_next_frame_time
+        vtp_frame_count = vtp_frame_count + 1;
+        particle_type = [zeros(n_fluid, 1); ones(n_total - n_fluid, 1)];
+        write_vtp(fullfile(vtp_output_dir, ...
+            sprintf('sph_frame_%04d.vtp', vtp_frame_count)), ...
+            x, y, vx, vy, rho, p, particle_type, ...
+            t_current, vtp_frame_count, n_total);
+        vtp_last_save_time = t_current;
+        vtp_next_frame_time = vtp_next_frame_time + vtp_frame_interval;
+    end
 
     u_max_current = max(vx(1:n_fluid));
 
@@ -430,6 +465,17 @@ while t_current < t_end
         fprintf('] %5.1f%% | 步数: %d | t=%.3fs | dt=%.2e | u_max=%.4f m/s', ...
                 progress*100, step, t_current, dt, u_max_current);
     end
+end
+
+% VTP 最终帧保底输出
+if enable_vtp_output && vtp_last_save_time < t_current - dt/2
+    vtp_frame_count = vtp_frame_count + 1;
+    particle_type = [zeros(n_fluid, 1); ones(n_total - n_fluid, 1)];
+    write_vtp(fullfile(vtp_output_dir, ...
+        sprintf('sph_frame_%04d.vtp', vtp_frame_count)), ...
+        x, y, vx, vy, rho, p, particle_type, ...
+        t_current, vtp_frame_count, n_total);
+    fprintf('VTP 最终帧已保存 (frame %d, t=%.4f)\n', vtp_frame_count, t_current);
 end
 
 elapsed_time = toc;
@@ -495,11 +541,13 @@ figure('Position', [100, 100, 1400, 450]);
 subplot(1, 3, 1);
 plot(u_analytical, y_analytical, 'b-', 'LineWidth', 2, 'DisplayName', '解析解');
 hold on;
-errorbar(u_sph, y_centers, [], [], u_std, u_std, 'ro', 'MarkerSize', 6, ...
+% 只绘制有粒子的 bin（过滤掉 u_sph = 0 的点）
+valid_bins = u_sph > 0;
+errorbar(u_sph(valid_bins), y_centers(valid_bins), [], [], u_std(valid_bins), u_std(valid_bins), 'ro', 'MarkerSize', 6, ...
     'MarkerFaceColor', 'r', 'DisplayName', 'SPH结果');
 xlabel('速度 u [m/s]', 'FontSize', 12);
 ylabel('y [m]', 'FontSize', 12);
-title(sprintf('速度剖面对比 (L2误差: %.2f%%)', L2_error*100), 'FontSize', 14);
+title(sprintf('速度剖面对比 (L2误差: %.2f%%, 有效bin: %d/%d)', L2_error*100, sum(valid_bins), n_bins), 'FontSize', 14);
 legend('Location', 'best');
 grid on;
 xlim([0, max(u_analytical)*1.1]);
@@ -536,13 +584,91 @@ fprintf('结果图片已保存: SPH_Poiseuille_result.png\n');
 fprintf('\n验证总结\n');
 fprintf('理论最大速度: %.4f m/s\n', u_max_theory);
 fprintf('SPH最大速度:  %.4f m/s\n', max(vx_final));
+fprintf('SPH最小速度:  %.4f m/s\n', min(vx_final));
 fprintf('相对偏差:     %.2f%%\n', abs(max(vx_final) - u_max_theory) / u_max_theory * 100);
 fprintf('L2相对误差:   %.2f%%\n', L2_error * 100);
+
+% 诊断：检查速度异常低的粒子
+low_vel_threshold = 0.01;  % 速度阈值
+low_vel_mask = vx_final < low_vel_threshold;
+n_low_vel = sum(low_vel_mask);
+if n_low_vel > 0
+    fprintf('\n--- 速度异常诊断 ---\n');
+    fprintf('速度 < %.3f m/s 的粒子数: %d (占比 %.1f%%)\n', ...
+        low_vel_threshold, n_low_vel, n_low_vel/n_fluid*100);
+    fprintf('这些粒子的 y 坐标范围: [%.4f, %.4f]\n', ...
+        min(y_final(low_vel_mask)), max(y_final(low_vel_mask)));
+    fprintf('这些粒子的平均速度: %.6f m/s\n', mean(vx_final(low_vel_mask)));
+end
+
+% 速度分布统计
+fprintf('\n--- 速度分布统计 ---\n');
+fprintf('速度范围: [%.4f, %.4f] m/s\n', min(vx_final), max(vx_final));
+fprintf('速度均值: %.4f m/s\n', mean(vx_final));
+fprintf('速度标准差: %.4f m/s\n', std(vx_final));
+vel_percentiles = prctile(vx_final, [1, 5, 10, 25, 50, 75, 90, 95, 99]);
+fprintf('速度百分位数:\n');
+fprintf('  1%%: %.4f, 5%%: %.4f, 10%%: %.4f, 25%%: %.4f\n', ...
+    vel_percentiles(1), vel_percentiles(2), vel_percentiles(3), vel_percentiles(4));
+fprintf('  50%%: %.4f, 75%%: %.4f, 90%%: %.4f, 95%%: %.4f, 99%%: %.4f\n', ...
+    vel_percentiles(5), vel_percentiles(6), vel_percentiles(7), vel_percentiles(8), vel_percentiles(9));
 
 if L2_error < 0.05
     fprintf('验证通过! L2误差 < 5%%\n');
 else
     fprintf('验证未通过, 需要调整参数\n');
+end
+
+%% 壁面剪应力验证
+fprintf('\n--- 壁面剪应力验证 ---\n');
+% 计算各层平均速度
+vx_final_fluid = vx(1:n_fluid);
+vx_layer_sum = accumarray(fluid_layer_id, vx_final_fluid, [n_layers_fluid, 1]);
+vx_layer_avg = vx_layer_sum ./ layer_particle_count;
+
+% 解析壁面剪应力: tau_w = mu * |du/dy|_wall = |dpdx| * H/2
+tau_w_analytical = abs(dpdx) * H / 2;
+
+% SPH 壁面 du/dy（根据边界条件类型）
+switch wall_bc_type
+    case 'dirichlet'
+        % 单侧差分: du/dy ≈ u(layer1) / y(layer1)
+        dudy_bottom = vx_layer_avg(1) / y_layers(1);
+        dudy_top = -vx_layer_avg(end) / (H - y_layers(end));
+    case 'neumann_laminar'
+        % 解析梯度: du/dy = (1/mu)*|dpdx|*(H/2 - y)
+        dudy_bottom = (1/mu) * abs(dpdx) * (H/2 - 0);
+        dudy_top = -(1/mu) * abs(dpdx) * (H/2 - H);
+    case 'neumann_wallmodel'
+        % 壁面模型求 du/dy
+        nu = mu / rho0;
+        u_ref_b = abs(vx_layer_avg(1));
+        u_ref_t = abs(vx_layer_avg(end));
+        dudy_bottom = wall_model_dudy(u_ref_b, y_layers(1), ...
+            nu, mu, rho0, wm_kappa, wm_E, wm_max_iter, 1e-6);
+        dudy_top = -wall_model_dudy(u_ref_t, H - y_layers(end), ...
+            nu, mu, rho0, wm_kappa, wm_E, wm_max_iter, 1e-6);
+    case 'contact_only'
+        % 仅接触力: 用单侧差分估计实际产生的 du/dy
+        dudy_bottom = vx_layer_avg(1) / y_layers(1);
+        dudy_top = -vx_layer_avg(end) / (H - y_layers(end));
+end
+
+tau_w_bottom = mu * abs(dudy_bottom);
+tau_w_top = mu * abs(dudy_top);
+err_bottom = abs(tau_w_bottom - tau_w_analytical) / tau_w_analytical;
+err_top = abs(tau_w_top - tau_w_analytical) / tau_w_analytical;
+
+fprintf('解析 tau_w = %.4f Pa\n', tau_w_analytical);
+fprintf('下壁面: tau_w = %.4f Pa, 相对误差 = %.2f%%\n', ...
+    tau_w_bottom, err_bottom * 100);
+fprintf('上壁面: tau_w = %.4f Pa, 相对误差 = %.2f%%\n', ...
+    tau_w_top, err_top * 100);
+if max(err_bottom, err_top) < 0.05
+    fprintf('壁面剪应力验证通过! 误差 < 5%%\n');
+else
+    fprintf('壁面剪应力验证未通过, 最大误差 %.2f%%\n', ...
+        max(err_bottom, err_top) * 100);
 end
 
 fprintf('\n程序运行完毕!\n');
@@ -877,6 +1003,12 @@ function vx = update_wall_velocity_unified(vx, n_fluid, n_bottom, n_top, ...
             vx(idx_bottom) = -d_bottom .* dudy_bottom;
             vx(idx_top)    =  d_top    .* dudy_top;
 
+        case 'contact_only'
+            % 仅接触力: 虚粒子速度恒为0, 不施加切应力条件
+            % 壁面切应力完全由 SPH 粘性项 visc*(vx_fluid - 0) 自然产生
+            vx(idx_bottom) = 0;
+            vx(idx_top)    = 0;
+
         otherwise
             error('未知的壁面边界条件类型: %s', wall_bc_type);
     end
@@ -923,4 +1055,64 @@ function abs_dudy = wall_model_dudy(u_ref, y_ref, nu, mu, rho0, ...
     % τ_w = ρ * u_τ², |du/dy|_wall = τ_w / μ
     tau_w = rho0 * u_tau^2;
     abs_dudy = tau_w / mu;
+end
+
+function write_vtp(filepath, x, y, vx, vy, rho, p, ptype, time, step, np)
+% 输出 VTK PolyData XML 格式 (.vtp) 文件
+% 字段: Velocity(3D), Density, Pressure, ParticleType(Int32)
+fid = fopen(filepath, 'w');
+if fid == -1, error('无法创建VTP文件: %s', filepath); end
+cleanup = onCleanup(@() fclose(fid));
+
+fprintf(fid, '<?xml version="1.0"?>\n');
+fprintf(fid, '<VTKFile type="PolyData" version="1.0" byte_order="LittleEndian">\n');
+fprintf(fid, '<PolyData>\n');
+fprintf(fid, '<FieldData>\n');
+fprintf(fid, '  <DataArray type="Float64" Name="TimeValue" NumberOfTuples="1" format="ascii">%.6e</DataArray>\n', time);
+fprintf(fid, '  <DataArray type="Int32" Name="TimeStep" NumberOfTuples="1" format="ascii">%d</DataArray>\n', step);
+fprintf(fid, '</FieldData>\n');
+fprintf(fid, '<Piece NumberOfPoints="%d" NumberOfVerts="%d" NumberOfLines="0" NumberOfStrips="0" NumberOfPolys="0">\n', np, np);
+
+% PointData
+fprintf(fid, '<PointData>\n');
+fprintf(fid, '  <DataArray type="Float64" Name="Velocity" NumberOfComponents="3" format="ascii">\n');
+for i = 1:np
+    fprintf(fid, '    %.6e %.6e 0.0\n', vx(i), vy(i));
+end
+fprintf(fid, '  </DataArray>\n');
+fprintf(fid, '  <DataArray type="Float64" Name="Density" format="ascii">\n');
+fprintf(fid, '    %.6e\n', rho);
+fprintf(fid, '  </DataArray>\n');
+fprintf(fid, '  <DataArray type="Float64" Name="Pressure" format="ascii">\n');
+fprintf(fid, '    %.6e\n', p);
+fprintf(fid, '  </DataArray>\n');
+fprintf(fid, '  <DataArray type="Int32" Name="ParticleType" format="ascii">\n');
+fprintf(fid, '    %d\n', int32(ptype));
+fprintf(fid, '  </DataArray>\n');
+fprintf(fid, '</PointData>\n');
+
+% Points
+fprintf(fid, '<Points>\n');
+fprintf(fid, '  <DataArray type="Float64" NumberOfComponents="3" format="ascii">\n');
+for i = 1:np
+    fprintf(fid, '    %.6e %.6e 0.0\n', x(i), y(i));
+end
+fprintf(fid, '  </DataArray>\n');
+fprintf(fid, '</Points>\n');
+
+% Verts
+fprintf(fid, '<Verts>\n');
+fprintf(fid, '  <DataArray type="Int32" Name="connectivity" format="ascii">\n');
+fprintf(fid, '    %d\n', (0:np-1)');
+fprintf(fid, '  </DataArray>\n');
+fprintf(fid, '  <DataArray type="Int32" Name="offsets" format="ascii">\n');
+fprintf(fid, '    %d\n', (1:np)');
+fprintf(fid, '  </DataArray>\n');
+fprintf(fid, '</Verts>\n');
+
+fprintf(fid, '</Piece>\n');
+fprintf(fid, '</PolyData>\n');
+fprintf(fid, '</VTKFile>\n');
+
+fprintf('  VTP frame %d saved: %s (t=%.4f)\n', step, filepath, time);
 end

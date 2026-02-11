@@ -23,5 +23,12 @@ CLAUDE.md
 *.autosave
 slprj/
 
+# VTP 流场输出
+vtp_output/
+vtp_*/
+
+# 测试结果图片
+result_*.png
+
 .claude/settings.local.json
 壁面边界条件报告.md
