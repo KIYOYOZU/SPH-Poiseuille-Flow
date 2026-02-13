@@ -8,8 +8,7 @@ clear; clc; close all;
 mex_dir = fileparts(mfilename('fullpath'));
 mex_src_dir = fullfile(mex_dir, 'mex');
 build_dir = fullfile(mex_dir, 'build');
-use_mex_step = false;
-step_mex_name = 'sph_step_mex_v2';
+step_mex_name = 'sph_step_mex';
 
 % 创建 build 目录
 if ~exist(build_dir, 'dir')
@@ -20,46 +19,41 @@ end
 % 添加 build 目录到 MATLAB 路径
 addpath(build_dir);
 
-mex_sources = {
-    'sph_step_mex.c', step_mex_name, 'use_mex_step'
-};
-for m = 1:size(mex_sources, 1)
-    src = fullfile(mex_src_dir, mex_sources{m, 1});
-    mex_name = mex_sources{m, 2};
-    bin = fullfile(build_dir, [mex_name '.' mexext]);
-    if ~exist(src, 'file'), continue; end
-    need_compile = ~exist(bin, 'file');
-    if ~need_compile
-        d_src = dir(src); d_bin = dir(bin);
-        need_compile = d_src.datenum > d_bin.datenum;
-    end
-    if need_compile
-        fprintf('编译 %s -> %s ...\n', mex_sources{m, 1}, mex_name);
-        try
-            mex('-R2018a', '-O', 'COMPFLAGS="$COMPFLAGS /openmp"', ...
-                '-output', mex_name, '-outdir', build_dir, src);
-            fprintf('编译成功! 输出到: %s\n', build_dir);
-        catch e
-            fprintf('编译失败: %s\n', e.message);
-        end
-    end
-    if exist(bin, 'file')
-        d_src = dir(src);
-        d_bin = dir(bin);
-        if d_bin.datenum >= d_src.datenum
-            eval([mex_sources{m, 3} ' = true;']);
-        else
-            fprintf('检测到 %s 过期且未完成更新，回退 MATLAB 实现。\n', mex_name);
-        end
+step_src = fullfile(mex_src_dir, 'sph_step_mex.c');
+step_bin = fullfile(build_dir, [step_mex_name '.' mexext]);
+if ~exist(step_src, 'file')
+    error('未找到 MEX 源码: %s', step_src);
+end
+
+need_compile = ~exist(step_bin, 'file');
+if ~need_compile
+    d_src = dir(step_src);
+    d_bin = dir(step_bin);
+    need_compile = d_src.datenum > d_bin.datenum;
+end
+
+if need_compile
+    fprintf('编译 %s -> %s ...\n', 'sph_step_mex.c', step_mex_name);
+    try
+        mex('-R2018a', '-O', 'COMPFLAGS="$COMPFLAGS /openmp"', ...
+            '-output', step_mex_name, '-outdir', build_dir, step_src);
+        fprintf('编译成功! 输出到: %s\n', build_dir);
+    catch e
+        error('MEX 编译失败，无法继续: %s', e.message);
     end
 end
 
-if strcmpi(strtrim(getenv('SPH_FORCE_MATLAB')), '1')
-    use_mex_step = false;
-    fprintf('检测到 SPH_FORCE_MATLAB=1，强制使用 MATLAB 回退实现。\n');
+if ~exist(step_bin, 'file')
+    error('MEX 二进制不存在，无法继续: %s', step_bin);
 end
 
-fprintf('MEX 加速: 融合单步=%s\n', mat2str(use_mex_step));
+d_src = dir(step_src);
+d_bin = dir(step_bin);
+if d_bin.datenum < d_src.datenum
+    error('MEX 二进制过期且未能更新: %s', step_bin);
+end
+
+fprintf('MEX 加速: 融合单步=true\n');
 
 %% 参数设置
 fprintf('SPH 平板泊肃叶流动模拟\n');
@@ -72,6 +66,13 @@ h = 1.3 * dx;       % 光滑长度
 rho0 = 1.0;         % 参考密度
 mu = 0.1;           % 动力粘度
 nu = mu / rho0;
+
+% 壁面有效厚度（SPHinXsys 风格）
+wall_thickness = 10 * dx;
+env_wall_thickness = str2double(strtrim(getenv('SPH_WALL_THICKNESS')));
+if isfinite(env_wall_thickness) && env_wall_thickness > 0
+    wall_thickness = env_wall_thickness * dx;
+end
 
 dpdx = -0.8;        % 压力梯度 -> u_max = |dpdx|*H^2/(8*mu) = 1.0
 gx = -dpdx / rho0;
@@ -133,12 +134,6 @@ if ~isempty(env_wall_bc)
     end
 end
 
-% 壁面模型参数（仅 neumann_wallmodel 使用）
-wm_kappa = 0.41;       % von Kármán 常数
-wm_E = 9.8;            % 对数律常数
-wm_max_iter = 20;      % 最大迭代次数
-wm_tol = 1e-6;         % 收敛容差
-
 fprintf('壁面边界条件: %s\n', wall_bc_type);
 
 %% 粒子初始化
@@ -152,31 +147,25 @@ x_f = X_fluid(:);
 y_f = Y_fluid(:);
 n_fluid = length(x_f);
 
-% 边界粒子 (上下壁面各3层虚粒子)
-n_layers = 3;
+% 边界粒子 (单层壁面粒子，SPHinXsys 风格)
+n_layers = 1;
 x_wall = (dx/2 : dx : L-dx/2)';
 n_wall_per_layer = length(x_wall);
 
-% 下壁面 (y < 0)
-x_bottom = repmat(x_wall, n_layers, 1);
-y_bottom = [];
-for layer = 1:n_layers
-    y_bottom = [y_bottom; ones(n_wall_per_layer, 1) * (-dx/2 - (layer-1)*dx)];
-end
+% 下壁面 (y = -dx/2)，仅 1 层
+x_bottom = x_wall;
+y_bottom = ones(n_wall_per_layer, 1) * (-dx/2);
 
-% 上壁面 (y > H)
-x_top = repmat(x_wall, n_layers, 1);
-y_top = [];
-for layer = 1:n_layers
-    y_top = [y_top; ones(n_wall_per_layer, 1) * (H + dx/2 + (layer-1)*dx)];
-end
+% 上壁面 (y = H + dx/2)，仅 1 层
+x_top = x_wall;
+y_top = ones(n_wall_per_layer, 1) * (H + dx/2);
 
 % 合并边界粒子
 x_b = [x_bottom; x_top];
 y_b = [y_bottom; y_top];
 n_boundary = length(x_b);
-n_bottom = n_layers * n_wall_per_layer;
-n_top = n_layers * n_wall_per_layer;
+n_bottom = n_wall_per_layer;  % 单层
+n_top = n_wall_per_layer;     % 单层
 
 % 合并所有粒子
 x = [x_f; x_b];
@@ -187,6 +176,11 @@ vx = zeros(n_total, 1);
 vy = zeros(n_total, 1);
 rho = rho0 * ones(n_total, 1);
 mass = rho0 * dx^2;
+
+% 壁面粒子有效质量（SPHinXsys 风格）
+mass_wall = rho0 * dx * wall_thickness;
+fprintf('壁面参数: n_layers=%d, wall_thickness=%.3f (%.1f*dx), mass_wall/mass=%.1f\n', ...
+    n_layers, wall_thickness, wall_thickness/dx, mass_wall/mass);
 
 fprintf('流体粒子数: %d\n', n_fluid);
 fprintf('边界粒子数: %d\n', n_boundary);
@@ -224,30 +218,17 @@ fprintf('壁面映射表预计算完成: %d 个流体层, %d 个壁面粒子\n',
 % Neumann BC 预计算：虚粒子到壁面距离 & 近壁流体层信息
 d_bottom = abs(y(idx_bottom));          % 下壁面虚粒子到 y=0 的距离
 d_top    = abs(y(idx_top) - H);         % 上壁面虚粒子到 y=H 的距离
-y_layer1_bottom = y_layers(1);          % 近壁第1层 y 坐标（下壁面）
-y_layer1_top    = H - y_layers(end);    % 近壁第1层到上壁面的距离
 
-% 动态 Neumann 梯度状态（每个壁面粒子独立）
+% 动态 Neumann 梯度状态（直接力求和方案）
 is_dynamic_neumann = ismember(wall_bc_type, {'neumann_laminar', 'neumann_wallmodel'});
-beta_base = 0.30;            % 基础时间融合系数
-neff_lo = 1.2;               % N_eff 低阈值
-neff_hi = 2.2;               % N_eff 高阈值
-eta2_lo = 0.006 * h^2;       % eta^2 低阈值
-eta2_hi = 0.03 * h^2;        % eta^2 高阈值
-cond_lo = 0.02;              % 拟合条件数低阈值
-cond_hi = 0.20;              % 拟合条件数高阈值
-r0 = 0.12;                   % 残差衰减尺度
-k_sign = 6.0;                % 软符号约束强度
-eps_conf = 1e-12;            % 置信度计算 epsilon
-wall_grad_state = zeros(n_boundary, 1);
-wall_grad_raw = zeros(n_boundary, 1);
-wall_quality = zeros(n_boundary, 7);    % [neighbor_count, n_eff, eta2_hat, fit_cond, sse_rel, c_sign, confidence_raw]
-wall_valid_mask = false(n_boundary, 1);
-wall_confidence = zeros(n_boundary, 1);
-wall_flip_mask = false(n_boundary, 1);
+bl_dudy_bottom_ema = 0;
+bl_dudy_top_ema = 0;
+bl_ema_alpha = 0.3;
+bl_grad = zeros(2, 1);
+bl_diag = zeros(8, 1);  % [n_bottom, L_bottom, tau_bottom, 0, n_top, L_top, tau_top, 0]
+bl_diag_last = zeros(8, 1);
 if is_dynamic_neumann
-    fprintf('动态Neumann启用: beta=%.2f, N_eff=[%.1f,%.1f], eta2=[%.3e,%.3e], cond=[%.2f,%.2f]\n', ...
-        beta_base, neff_lo, neff_hi, eta2_lo, eta2_hi, cond_lo, cond_hi);
+    fprintf('动态Neumann启用: 直接力求和方案, EMA alpha=%.2f\n', bl_ema_alpha);
 end
 
 %% 核函数参数
@@ -273,23 +254,11 @@ cell_size_x = L / n_cell_x;
 cell_size_y = (y_max_domain - y_min_domain) / n_cell_y;
 n_cells = n_cell_x * n_cell_y;
 
-% 半模板：[自身, 右, 左上, 上, 右上]（5个方向，覆盖所有不重复邻居对）
-% 注意：不需要[-1,0]，因为(cx,cy)→(cx+1,cy)已覆盖所有水平相邻对
-stencil = [0,0; 1,0; -1,1; 0,1; 1,1];
-
 % 核函数自身贡献 W(r=0)
 W_self = alpha_kernel * 2/3;
 
 % 粘性稳定性时间步长（常数，提到循环外）
 dt_visc = 0.125 * h^2 / nu;
-
-% 预分配邻居列表数组
-max_pairs = n_total * 30;
-pair_i_buf = zeros(max_pairs, 1);
-pair_j_buf = zeros(max_pairs, 1);
-dx_pair_buf = zeros(max_pairs, 1);
-dy_pair_buf = zeros(max_pairs, 1);
-r_pair_buf = zeros(max_pairs, 1);
 
 % XSPH 修正初始化（第一步无历史数据，设为零）
 vx_xsph = zeros(n_total, 1);
@@ -300,35 +269,20 @@ fprintf('计算初始加速度...\n');
 
 % 壁面速度边界条件（初始速度为零，此处主要为完整性）
 if is_dynamic_neumann
-    vx = apply_neumann_dynamic(vx, n_fluid, n_bottom, n_top, d_bottom, d_top, wall_grad_state);
+    vx = apply_neumann_boundary_layer(vx, n_fluid, n_bottom, n_top, ...
+        d_bottom, d_top, bl_dudy_bottom_ema, bl_dudy_top_ema);
 else
     vx = update_wall_velocity_unified(vx, n_fluid, n_bottom, n_top, ...
         fluid_layer_id, layer_particle_count, n_layers_fluid, ...
         wall_bottom_k1, wall_bottom_k2, wall_bottom_w1, wall_bottom_w2, ...
         wall_top_k1, wall_top_k2, wall_top_w1, wall_top_w2, ...
-        wall_bc_type, d_bottom, d_top, y_layer1_bottom, y_layer1_top, ...
-        H, mu, rho0, wm_kappa, wm_E, wm_max_iter, wm_tol);
+        wall_bc_type);
 end
 
-if use_mex_step
-    [ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs, wall_grad_raw, wall_quality] = ...
-        feval(step_mex_name, x, y, vx, vy, n_total, n_fluid, L, r_cut, ...
-        y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, n_cells, ...
-        h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, 0, n_bottom, H);
-else
-    [pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs] = ...
-        cell_linked_list_search(x, y, n_total, L, r_cut, ...
-        y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, ...
-        n_cells, stencil, pair_i_buf, pair_j_buf, dx_pair_buf, dy_pair_buf, r_pair_buf);
-
-    [ax, ay, rho, p, W_pair, ~, ~, vx_xsph, vy_xsph] = ...
-        sph_compute_forces(pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs, ...
-        x, y, vx, vy, n_total, n_fluid, h, alpha_kernel, W_self, mass, ...
-        cs, rho0, mu, gx, epsilon_xsph, false);
-    [wall_grad_raw, wall_quality] = compute_wall_gradient_from_pairs( ...
-        pair_i, pair_j, W_pair, vx, y, rho, mass, n_fluid, n_bottom, H, ...
-        neff_lo, neff_hi, eta2_lo, eta2_hi, cond_lo, cond_hi, r0, k_sign, eps_conf);
-end
+[ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs, bl_grad, bl_diag] = ...
+    feval(step_mex_name, x, y, vx, vy, n_total, n_fluid, L, r_cut, ...
+    y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, n_cells, ...
+    h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, 0, n_bottom, H, dx, mass_wall);
 
 % 用初始 SPH 密度修正质量（消除核函数离散求和的系统偏差）
 rho0_sph = mean(rho(1:n_fluid));
@@ -339,29 +293,11 @@ mass = mass * mass_correction;
 fprintf('质量修正因子: %.4f, 修正后 mass=%.6e\n', mass_correction, mass);
 
 % 重新计算初始力（使用修正后的 mass）
-if use_mex_step
-    [ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs, wall_grad_raw, wall_quality] = ...
-        feval(step_mex_name, x, y, vx, vy, n_total, n_fluid, L, r_cut, ...
-        y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, n_cells, ...
-        h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, 0, n_bottom, H);
-else
-    [ax, ay, rho, p, W_pair, ~, ~, vx_xsph, vy_xsph] = ...
-        sph_compute_forces(pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs, ...
-        x, y, vx, vy, n_total, n_fluid, h, alpha_kernel, W_self, mass, ...
-        cs, rho0, mu, gx, epsilon_xsph, false);
-    [wall_grad_raw, wall_quality] = compute_wall_gradient_from_pairs( ...
-        pair_i, pair_j, W_pair, vx, y, rho, mass, n_fluid, n_bottom, H, ...
-        neff_lo, neff_hi, eta2_lo, eta2_hi, cond_lo, cond_hi, r0, k_sign, eps_conf);
-end
+[ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs, bl_grad, bl_diag] = ...
+    feval(step_mex_name, x, y, vx, vy, n_total, n_fluid, L, r_cut, ...
+    y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, n_cells, ...
+    h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, 0, n_bottom, H, dx, mass_wall);
 fprintf('修正后 SPH 密度: mean=%.4f\n', mean(rho(1:n_fluid)));
-
-if is_dynamic_neumann
-    [wall_grad_state, wall_valid_mask, wall_confidence, wall_flip_mask] = update_wall_gradient_state( ...
-        wall_grad_state, wall_grad_raw, wall_quality, wall_bc_type, ...
-        n_bottom, beta_base, neff_lo, neff_hi, eta2_lo, eta2_hi, ...
-        cond_lo, cond_hi, r0, k_sign, eps_conf, ...
-        mu, rho0, wm_kappa, wm_E, wm_max_iter, wm_tol);
-end
 
 fprintf('初始邻居对数: %d (平均每粒子 %.1f 个邻居)\n', n_pairs, 2*n_pairs/n_total);
 
@@ -413,44 +349,36 @@ while t_current < t_end
 
     % --- 壁面速度边界条件 ---
     if is_dynamic_neumann
-        vx = apply_neumann_dynamic(vx, n_fluid, n_bottom, n_top, d_bottom, d_top, wall_grad_state);
+        vx = apply_neumann_boundary_layer(vx, n_fluid, n_bottom, n_top, ...
+            d_bottom, d_top, bl_dudy_bottom_ema, bl_dudy_top_ema);
     else
         vx = update_wall_velocity_unified(vx, n_fluid, n_bottom, n_top, ...
             fluid_layer_id, layer_particle_count, n_layers_fluid, ...
             wall_bottom_k1, wall_bottom_k2, wall_bottom_w1, wall_bottom_w2, ...
             wall_top_k1, wall_top_k2, wall_top_w1, wall_top_w2, ...
-            wall_bc_type, d_bottom, d_top, y_layer1_bottom, y_layer1_top, ...
-            H, mu, rho0, wm_kappa, wm_E, wm_max_iter, wm_tol);
+            wall_bc_type);
     end
 
-    % --- SPH 单步计算（融合 MEX 或 MATLAB 回退） ---
+    % --- SPH 单步计算（仅 MEX 路径） ---
     do_shepard = (mod(step, 30) == 0);
-    if use_mex_step
-        [ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs, wall_grad_raw, wall_quality] = ...
-            feval(step_mex_name, x, y, vx, vy, n_total, n_fluid, L, r_cut, ...
-            y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, n_cells, ...
-            h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, double(do_shepard), n_bottom, H);
-    else
-        [pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs] = ...
-            cell_linked_list_search(x, y, n_total, L, r_cut, ...
-            y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, ...
-            n_cells, stencil, pair_i_buf, pair_j_buf, dx_pair_buf, dy_pair_buf, r_pair_buf);
-
-        [ax, ay, rho, p, W_pair, ~, ~, vx_xsph, vy_xsph] = ...
-            sph_compute_forces(pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs, ...
-            x, y, vx, vy, n_total, n_fluid, h, alpha_kernel, W_self, mass, ...
-            cs, rho0, mu, gx, epsilon_xsph, do_shepard);
-        [wall_grad_raw, wall_quality] = compute_wall_gradient_from_pairs( ...
-            pair_i, pair_j, W_pair, vx, y, rho, mass, n_fluid, n_bottom, H, ...
-            neff_lo, neff_hi, eta2_lo, eta2_hi, cond_lo, cond_hi, r0, k_sign, eps_conf);
-    end
+    [ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs, bl_grad, bl_diag] = ...
+        feval(step_mex_name, x, y, vx, vy, n_total, n_fluid, L, r_cut, ...
+        y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, n_cells, ...
+        h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, double(do_shepard), n_bottom, H, dx, mass_wall);
 
     if is_dynamic_neumann
-        [wall_grad_state, wall_valid_mask, wall_confidence, wall_flip_mask] = update_wall_gradient_state( ...
-            wall_grad_state, wall_grad_raw, wall_quality, wall_bc_type, ...
-            n_bottom, beta_base, neff_lo, neff_hi, eta2_lo, eta2_hi, ...
-            cond_lo, cond_hi, r0, k_sign, eps_conf, ...
-            mu, rho0, wm_kappa, wm_E, wm_max_iter, wm_tol);
+        dudy_bottom_raw = bl_grad(1);
+        dudy_top_raw = bl_grad(2);
+
+        if dudy_bottom_raw > 0 && bl_diag(1) >= 2
+            bl_dudy_bottom_ema = (1 - bl_ema_alpha) * bl_dudy_bottom_ema + ...
+                                 bl_ema_alpha * dudy_bottom_raw;
+        end
+        if dudy_top_raw < 0 && bl_diag(5) >= 2
+            bl_dudy_top_ema = (1 - bl_ema_alpha) * bl_dudy_top_ema + ...
+                              bl_ema_alpha * dudy_top_raw;
+        end
+        bl_diag_last = bl_diag;
     end
 
     % --- Verlet 完成速度 ---
@@ -503,33 +431,13 @@ while t_current < t_end
     end
 
     if is_dynamic_neumann && mod(step, 100) == 0
-        valid_ratio = mean(wall_valid_mask);
-        mean_neff = mean(wall_quality(:, 2));
-
-        idx_l1 = [1:n_wall_per_layer, n_bottom + (1:n_wall_per_layer)];
-        idx_l2 = [n_wall_per_layer + (1:n_wall_per_layer), ...
-                  n_bottom + n_wall_per_layer + (1:n_wall_per_layer)];
-        idx_l3 = [2*n_wall_per_layer + (1:n_wall_per_layer), ...
-                  n_bottom + 2*n_wall_per_layer + (1:n_wall_per_layer)];
-
-        conf_l1 = mean(wall_confidence(idx_l1));
-        conf_l2 = mean(wall_confidence(idx_l2));
-        conf_l3 = mean(wall_confidence(idx_l3));
-        flip_l1 = mean(wall_flip_mask(idx_l1));
-        flip_l2 = mean(wall_flip_mask(idx_l2));
-        flip_l3 = mean(wall_flip_mask(idx_l3));
-        std_l1 = std(wall_grad_state(idx_l1));
-        std_l2 = std(wall_grad_state(idx_l2));
-        std_l3 = std(wall_grad_state(idx_l3));
-
-        fprintf(['\n[BC诊断] step=%d, valid=%.1f%%, mean(N_eff)=%.2f | ' ...
-                 'conf[L1/L2/L3]=%.2f/%.2f/%.2f | ' ...
-                 'flip[L1/L2/L3]=%.2f%%/%.2f%%/%.2f%% | ' ...
-                 'std(g)[L1/L2/L3]=%.3e/%.3e/%.3e\n'], ...
-            step, valid_ratio*100, mean_neff, ...
-            conf_l1, conf_l2, conf_l3, ...
-            flip_l1*100, flip_l2*100, flip_l3*100, ...
-            std_l1, std_l2, std_l3);
+        fprintf(['\n[直接力求和] step=%d | bottom: n_wall=%d, L=%.3f, tau=%.4e, ' ...
+                 'dudy_raw=%.4f, dudy_ema=%.4f | top: n_wall=%d, L=%.3f, tau=%.4e, ' ...
+                 'dudy_raw=%.4f, dudy_ema=%.4f\n'], ...
+            step, round(bl_diag_last(1)), bl_diag_last(2), bl_diag_last(3), ...
+            bl_grad(1), bl_dudy_bottom_ema, ...
+            round(bl_diag_last(5)), bl_diag_last(6), bl_diag_last(7), ...
+            bl_grad(2), bl_dudy_top_ema);
     end
 
     % --- 进度显示 ---
@@ -729,32 +637,9 @@ switch wall_bc_type
         % 单侧差分: du/dy ≈ u(layer1) / y(layer1)
         dudy_bottom = vx_layer_avg(1) / y_layers(1);
         dudy_top = -vx_layer_avg(end) / (H - y_layers(end));
-    case 'neumann_laminar'
-        if is_dynamic_neumann
-            idx_bottom_l1 = 1:n_wall_per_layer;
-            idx_top_l1 = n_bottom + (1:n_wall_per_layer);
-            dudy_bottom = mean(wall_grad_state(idx_bottom_l1));
-            dudy_top = mean(wall_grad_state(idx_top_l1));
-        else
-            dudy_bottom = (1/mu) * abs(dpdx) * (H/2 - 0);
-            dudy_top = -(1/mu) * abs(dpdx) * (H/2 - H);
-        end
-    case 'neumann_wallmodel'
-        if is_dynamic_neumann
-            idx_bottom_l1 = 1:n_wall_per_layer;
-            idx_top_l1 = n_bottom + (1:n_wall_per_layer);
-            dudy_bottom = mean(wall_grad_state(idx_bottom_l1));
-            dudy_top = mean(wall_grad_state(idx_top_l1));
-        else
-            % 壁面模型求 du/dy
-            nu = mu / rho0;
-            u_ref_b = abs(vx_layer_avg(1));
-            u_ref_t = abs(vx_layer_avg(end));
-            dudy_bottom = wall_model_dudy(u_ref_b, y_layers(1), ...
-                nu, mu, rho0, wm_kappa, wm_E, wm_max_iter, 1e-6);
-            dudy_top = -wall_model_dudy(u_ref_t, H - y_layers(end), ...
-                nu, mu, rho0, wm_kappa, wm_E, wm_max_iter, 1e-6);
-        end
+    case {'neumann_laminar', 'neumann_wallmodel'}
+        dudy_bottom = bl_dudy_bottom_ema;
+        dudy_top = bl_dudy_top_ema;
     case 'contact_only'
         % 仅接触力: 用单侧差分估计实际产生的 du/dy
         dudy_bottom = vx_layer_avg(1) / y_layers(1);
@@ -771,18 +656,6 @@ fprintf('下壁面: tau_w = %.4f Pa, 相对误差 = %.2f%%\n', ...
     tau_w_bottom, err_bottom * 100);
 fprintf('上壁面: tau_w = %.4f Pa, 相对误差 = %.2f%%\n', ...
     tau_w_top, err_top * 100);
-if is_dynamic_neumann
-    idx_bottom_l1 = 1:n_wall_per_layer;
-    idx_top_l1 = n_bottom + (1:n_wall_per_layer);
-    valid_ratio_bottom = mean(wall_valid_mask(idx_bottom_l1));
-    valid_ratio_top = mean(wall_valid_mask(idx_top_l1));
-    conf_bottom = mean(wall_confidence(idx_bottom_l1));
-    conf_top = mean(wall_confidence(idx_top_l1));
-    flip_bottom = mean(wall_flip_mask(idx_bottom_l1));
-    flip_top = mean(wall_flip_mask(idx_top_l1));
-    fprintf('动态Neumann质量: 下壁L1有效率=%.1f%%, 上壁L1有效率=%.1f%%, conf=%.2f/%.2f, flip=%.2f%%/%.2f%%\n', ...
-        valid_ratio_bottom*100, valid_ratio_top*100, conf_bottom, conf_top, flip_bottom*100, flip_top*100);
-end
 if max(err_bottom, err_top) < 0.05
     fprintf('壁面剪应力验证通过! 误差 < 5%%\n');
 else
@@ -794,201 +667,8 @@ fprintf('\n程序运行完毕!\n');
 
 %% Local Functions
 
-function [pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs] = ...
-        cell_linked_list_search(x, y, n_total, L, r_cut, ...
-        y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, ...
-        n_cells, stencil, pair_i_buf, pair_j_buf, dx_pair_buf, dy_pair_buf, r_pair_buf)
-% Cell-Linked List 邻居搜索（半模板遍历）
 
-    % 粒子→单元映射 + 排序构建索引
-    cell_ix = min(max(floor(mod(x, L) / cell_size_x) + 1, 1), n_cell_x);
-    cell_iy = min(max(floor((y - y_min_domain) / cell_size_y) + 1, 1), n_cell_y);
-    cell_id = (cell_iy - 1) * n_cell_x + cell_ix;
 
-    [cell_id_sorted, sort_idx] = sort(cell_id);
-    particle_sorted = sort_idx;
-    cell_start = zeros(n_cells, 1);
-    cell_end = zeros(n_cells, 1);
-    changes = [1; find(diff(cell_id_sorted)) + 1; n_total + 1];
-    for kk = 1:length(changes)-1
-        cid = cell_id_sorted(changes(kk));
-        cell_start(cid) = changes(kk);
-        cell_end(cid) = changes(kk+1) - 1;
-    end
-
-    % 遍历单元对
-    n_pairs = 0;
-    r_cut_sq = r_cut^2;
-
-    for cy = 1:n_cell_y
-        for cx = 1:n_cell_x
-            cid1 = (cy-1)*n_cell_x + cx;
-            if cell_start(cid1) == 0, continue; end
-
-            for s = 1:size(stencil, 1)
-                ncx = cx + stencil(s, 1);
-                ncy = cy + stencil(s, 2);
-
-                % y方向越界跳过（非周期性）
-                if ncy < 1 || ncy > n_cell_y, continue; end
-
-                % x方向周期性 wrap
-                x_shift = 0;
-                if ncx < 1
-                    ncx = ncx + n_cell_x;
-                    x_shift = L;
-                elseif ncx > n_cell_x
-                    ncx = ncx - n_cell_x;
-                    x_shift = -L;
-                end
-
-                cid2 = (ncy-1)*n_cell_x + ncx;
-                if cell_start(cid2) == 0, continue; end
-
-                % 遍历两个单元中的粒子对
-                for ii = cell_start(cid1):cell_end(cid1)
-                    pi_idx = particle_sorted(ii);
-                    if cid1 == cid2
-                        jj_start = ii + 1;
-                    else
-                        jj_start = cell_start(cid2);
-                    end
-                    for jj = jj_start:cell_end(cid2)
-                        pj_idx = particle_sorted(jj);
-                        dxx = x(pi_idx) - x(pj_idx) + x_shift;
-                        dyy = y(pi_idx) - y(pj_idx);
-                        rr_sq = dxx^2 + dyy^2;
-                        if rr_sq < r_cut_sq && rr_sq > 0
-                            n_pairs = n_pairs + 1;
-                            pair_i_buf(n_pairs) = pi_idx;
-                            pair_j_buf(n_pairs) = pj_idx;
-                            dx_pair_buf(n_pairs) = dxx;
-                            dy_pair_buf(n_pairs) = dyy;
-                            r_pair_buf(n_pairs) = sqrt(rr_sq);
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    pair_i = pair_i_buf(1:n_pairs);
-    pair_j = pair_j_buf(1:n_pairs);
-    dx_pair = dx_pair_buf(1:n_pairs);
-    dy_pair = dy_pair_buf(1:n_pairs);
-    r_pair = r_pair_buf(1:n_pairs);
-end
-
-function [ax, ay, rho, p_out, W_pair, rho_i, rho_j, vx_xsph_out, vy_xsph_out] = ...
-        sph_compute_forces(pair_i, pair_j, dx_pair, dy_pair, r_pair, n_pairs, ...
-        x, y, vx, vy, n_total, n_fluid, h, alpha_kernel, W_self, mass, ...
-        cs, rho0, mu, gx, epsilon_xsph, do_shepard)
-% SPH 力计算（核函数 + 密度 + 压力 + 加速度 + XSPH）
-% Morris (1997) 粘性项 + Shepard 密度修正
-
-    % 核函数（向量化，只对 n_pairs 个邻居对）
-    q_pair = r_pair / h;
-    W_pair = zeros(n_pairs, 1);
-    dWdr_pair = zeros(n_pairs, 1);
-
-    mask1 = q_pair < 1;
-    W_pair(mask1) = alpha_kernel * (2/3 - q_pair(mask1).^2 + 0.5*q_pair(mask1).^3);
-    dWdr_pair(mask1) = alpha_kernel * (-2*q_pair(mask1) + 1.5*q_pair(mask1).^2) / h;
-
-    mask2 = (q_pair >= 1) & (q_pair < 2);
-    W_pair(mask2) = alpha_kernel * (1/6) * (2 - q_pair(mask2)).^3;
-    dWdr_pair(mask2) = alpha_kernel * (-0.5) * (2 - q_pair(mask2)).^2 / h;
-
-    % 密度求和（对称累加 + 自身贡献）
-    rho = mass * (accumarray(pair_i, W_pair, [n_total,1]) + ...
-                  accumarray(pair_j, W_pair, [n_total,1]) + W_self);
-
-    % Shepard 密度修正（使用未修正密度计算归一化因子，避免循环依赖）
-    if do_shepard
-        rho_raw = rho;  % 保存未修正密度
-        % Shepard 归一化因子: S_i = Σ_j (m/ρ_j) * W_ij + (m/ρ_i)*W_self
-        vol_j_W_ij = mass * W_pair ./ rho_raw(pair_j);
-        vol_i_W_ji = mass * W_pair ./ rho_raw(pair_i);
-        shepard_factor = accumarray(pair_i, vol_j_W_ij, [n_total,1]) + ...
-                         accumarray(pair_j, vol_i_W_ji, [n_total,1]) + ...
-                         mass * W_self ./ rho_raw;
-        shepard_factor(shepard_factor < 0.5) = 0.5;
-        shepard_factor(shepard_factor > 1.5) = 1.5;
-        rho = rho_raw ./ shepard_factor;
-    end
-
-    % 压力（弱可压缩状态方程）
-    p_out = cs^2 * (rho - rho0);
-
-    % 方向向量
-    r_safe = max(r_pair, 1e-12);
-    ex = dx_pair ./ r_safe;
-    ey = dy_pair ./ r_safe;
-
-    % 提取粒子对属性
-    p_i = p_out(pair_i);  p_j = p_out(pair_j);
-    rho_i = rho(pair_i);  rho_j = rho(pair_j);
-
-    % 压力项：f_ij = -m * (pi/ρi² + pj/ρj²) * dW/dr * e_ij
-    press_coef = -mass * (p_i./rho_i.^2 + p_j./rho_j.^2) .* dWdr_pair;
-
-    % 粘性项（Morris 1997，增加 0.01h² 正则化）
-    dvx_pair = vx(pair_i) - vx(pair_j);
-    dvy_pair = vy(pair_i) - vy(pair_j);
-    visc_common = mass * 2*mu ./ (rho_i.*rho_j) .* ...
-                  (r_pair .* dWdr_pair) ./ (r_pair.^2 + 0.01*h^2);
-
-    % 合力（对粒子 i 的贡献）
-    fx = press_coef .* ex + visc_common .* dvx_pair;
-    fy = press_coef .* ey + visc_common .* dvy_pair;
-
-    % 对称累加（牛顿第三定律）
-    ax = accumarray(pair_i, fx, [n_total,1]) - accumarray(pair_j, fx, [n_total,1]);
-    ay = accumarray(pair_i, fy, [n_total,1]) - accumarray(pair_j, fy, [n_total,1]);
-
-    % 体积力（仅流体粒子）
-    ax(1:n_fluid) = ax(1:n_fluid) + gx;
-
-    % XSPH 速度修正
-    dvx_xsph = mass * (vx(pair_j)-vx(pair_i)) .* W_pair .* 2./(rho_i+rho_j);
-    dvy_xsph = mass * (vy(pair_j)-vy(pair_i)) .* W_pair .* 2./(rho_i+rho_j);
-    vx_xsph_out = accumarray(pair_i, dvx_xsph, [n_total,1]) + ...
-                   accumarray(pair_j, -dvx_xsph, [n_total,1]);
-    vy_xsph_out = accumarray(pair_i, dvy_xsph, [n_total,1]) + ...
-                   accumarray(pair_j, -dvy_xsph, [n_total,1]);
-end
-
-function vx = update_wall_velocity(vx, vy, y, n_fluid, n_bottom, n_top, H)
-% 镜像速度边界条件: 壁面虚粒子速度 = -u_fluid(y_mirror)
-
-    y_fluid = y(1:n_fluid);
-    vx_fluid = vx(1:n_fluid);
-
-    % 下壁面
-    idx_bottom = (n_fluid+1):(n_fluid+n_bottom);
-    y_mirror_bottom = -y(idx_bottom);
-    y_mirror_bottom = max(0, min(H, y_mirror_bottom));
-
-    % 上壁面
-    idx_top = (n_fluid+n_bottom+1):(n_fluid+n_bottom+n_top);
-    y_mirror_top = 2*H - y(idx_top);
-    y_mirror_top = max(0, min(H, y_mirror_top));
-
-    % 用 interp1 插值获取镜像点速度
-    [y_sorted, sort_idx] = sort(y_fluid);
-    vx_sorted = vx_fluid(sort_idx);
-
-    % 用唯一y值做插值（同一y层取平均）
-    [y_unique, ~, ic] = unique(round(y_sorted, 10));
-    vx_unique = accumarray(ic, vx_sorted, [], @mean);
-
-    % 线性插值获取镜像点速度，然后取反
-    vx_mirror_bottom = interp1(y_unique, vx_unique, y_mirror_bottom, 'linear', 'extrap');
-    vx(idx_bottom) = -vx_mirror_bottom;
-
-    vx_mirror_top = interp1(y_unique, vx_unique, y_mirror_top, 'linear', 'extrap');
-    vx(idx_top) = -vx_mirror_top;
-end
 
 function [k1, k2, w1, w2] = precompute_interp_weights(y_query, y_layers)
 % 预计算线性插值的索引和权重: w1*v(k1) + w2*v(k2)
@@ -1020,28 +700,6 @@ function [k1, k2, w1, w2] = precompute_interp_weights(y_query, y_layers)
     end
 end
 
-function vx = update_wall_velocity_fast(vx, n_fluid, n_bottom, n_top, ...
-    fluid_layer_id, layer_particle_count, n_layers_fluid, ...
-    wall_bottom_k1, wall_bottom_k2, wall_bottom_w1, wall_bottom_w2, ...
-    wall_top_k1, wall_top_k2, wall_top_w1, wall_top_w2)
-% 快速壁面速度更新（预计算映射表，无 sort/unique/interp1）
-
-    vx_fluid = vx(1:n_fluid);
-    vx_layer_sum = accumarray(fluid_layer_id, vx_fluid, [n_layers_fluid, 1]);
-    vx_layer = vx_layer_sum ./ layer_particle_count;
-
-    % 下壁面
-    idx_bottom = (n_fluid+1):(n_fluid+n_bottom);
-    vx_mirror = wall_bottom_w1 .* vx_layer(wall_bottom_k1) + ...
-                wall_bottom_w2 .* vx_layer(wall_bottom_k2);
-    vx(idx_bottom) = -vx_mirror;
-
-    % 上壁面
-    idx_top = (n_fluid+n_bottom+1):(n_fluid+n_bottom+n_top);
-    vx_mirror = wall_top_w1 .* vx_layer(wall_top_k1) + ...
-                wall_top_w2 .* vx_layer(wall_top_k2);
-    vx(idx_top) = -vx_mirror;
-end
 
 function profile_mean = compute_binned_profile_mean(y_values, u_values, y_edges)
 % 计算分箱平均速度剖面（用于稳态判据）
@@ -1057,214 +715,25 @@ function profile_mean = compute_binned_profile_mean(y_values, u_values, y_edges)
     profile_mean = u_sum ./ max(u_count, 1);
 end
 
-function vx = apply_neumann_dynamic(vx, n_fluid, n_bottom, n_top, d_bottom, d_top, wall_grad_state)
-% 动态 Neumann BC: 使用每个壁面粒子的局部梯度状态更新虚粒子速度
+
+function vx = apply_neumann_boundary_layer(vx, n_fluid, n_bottom, n_top, ...
+    d_bottom, d_top, dudy_bottom, dudy_top)
+% 动态 Neumann BC: 使用边界层全局拟合梯度更新虚粒子速度
 
     idx_bottom = (n_fluid+1):(n_fluid+n_bottom);
     idx_top = (n_fluid+n_bottom+1):(n_fluid+n_bottom+n_top);
 
-    vx(idx_bottom) = -d_bottom .* wall_grad_state(1:n_bottom);
-    vx(idx_top)    =  d_top    .* wall_grad_state(n_bottom+1:n_bottom+n_top);
-end
-
-function [wall_grad_state, wall_valid_mask, wall_confidence, wall_flip_mask] = update_wall_gradient_state( ...
-    wall_grad_state, wall_grad_raw, wall_quality, wall_bc_type, ...
-    n_bottom, beta_base, neff_lo, neff_hi, eta2_lo, eta2_hi, ...
-    cond_lo, cond_hi, r0, k_sign, eps_conf, ...
-    mu, rho0, wm_kappa, wm_E, wm_max_iter, wm_tol)
-% 更新动态 Neumann 梯度状态（连续置信度融合 + 软符号约束）
-
-    if isempty(wall_grad_state)
-        wall_valid_mask = false(0, 1);
-        wall_confidence = zeros(0, 1);
-        wall_flip_mask = false(0, 1);
-        return;
-    end
-
-    n_boundary = length(wall_grad_state);
-    n_eff = wall_quality(:, 2);
-    eta2_hat = wall_quality(:, 3);
-    fit_cond = wall_quality(:, 4);
-    sse_rel = wall_quality(:, 5);
-
-    sign_expect = ones(n_boundary, 1);
-    sign_expect(n_bottom+1:end) = -1;
-
-    g_target = wall_grad_raw;
-    if strcmp(wall_bc_type, 'neumann_wallmodel')
-        nu = mu / rho0;
-        for wi = 1:n_boundary
-            if ~isfinite(g_target(wi))
-                continue;
-            end
-            y_ref = sqrt(max(eta2_hat(wi), eps_conf));
-            u_ref = abs(g_target(wi)) * y_ref;
-            abs_dudy = wall_model_dudy(u_ref, y_ref, nu, mu, rho0, ...
-                wm_kappa, wm_E, wm_max_iter, wm_tol);
-            if wi <= n_bottom
-                g_target(wi) = abs_dudy;
-            else
-                g_target(wi) = -abs_dudy;
-            end
-        end
-    end
-
-    c_neff = clamp01_vec((n_eff - neff_lo) ./ max(neff_hi - neff_lo, eps_conf));
-    c_eta = clamp01_vec((eta2_hat - eta2_lo) ./ max(eta2_hi - eta2_lo, eps_conf));
-    c_fit = clamp01_vec((fit_cond - cond_lo) ./ max(cond_hi - cond_lo, eps_conf));
-
-    sse_rel = max(0, sse_rel);
-    c_res = exp(-sse_rel ./ max(r0, eps_conf));
-
-    x_sign = k_sign .* sign_expect .* wall_grad_raw;
-    x_sign = max(min(x_sign, 50), -50);
-    c_sign = 1 ./ (1 + exp(-x_sign));
-
-    wall_confidence = c_neff .* c_eta .* c_fit .* c_res .* c_sign;
-    wall_confidence(~isfinite(wall_confidence)) = 0;
-    wall_confidence = clamp01_vec(wall_confidence);
-
-    alpha = beta_base .* wall_confidence;
-    g_new = (1 - alpha) .* wall_grad_state + alpha .* g_target;
-
-    wall_flip_mask = (sign_expect .* g_new) < 0;
-    lambda_flip = 0.15 .* wall_confidence;
-    g_new(wall_flip_mask) = (1 - lambda_flip(wall_flip_mask)) .* wall_grad_state(wall_flip_mask) + ...
-                             lambda_flip(wall_flip_mask)      .* g_new(wall_flip_mask);
-
-    bad_target = ~isfinite(g_target);
-    g_new(bad_target) = wall_grad_state(bad_target);
-
-    wall_grad_state = g_new;
-    bad_state = ~isfinite(wall_grad_state);
-    wall_grad_state(bad_state) = 0;
-    wall_valid_mask = wall_confidence > 0.05;
-end
-
-function [wall_grad_raw, wall_quality] = compute_wall_gradient_from_pairs( ...
-    pair_i, pair_j, W_pair, vx, y, rho, mass, n_fluid, n_bottom, H, ...
-    neff_lo, neff_hi, eta2_lo, eta2_hi, cond_lo, cond_hi, r0, k_sign, eps_conf)
-% MATLAB 回退路径：按 MEX 同公式计算动态壁面梯度与质量指标（带截距拟合）
-
-    n_boundary = length(y) - n_fluid;
-    n_pairs = length(pair_i);
-
-    s0 = zeros(n_boundary, 1);
-    s0_sq = zeros(n_boundary, 1);
-    s1 = zeros(n_boundary, 1);
-    s2 = zeros(n_boundary, 1);
-    su = zeros(n_boundary, 1);
-    seta_u = zeros(n_boundary, 1);
-    su2 = zeros(n_boundary, 1);
-    neighbor_count = zeros(n_boundary, 1);
-
-    for k = 1:n_pairs
-        ii = pair_i(k);
-        jj = pair_j(k);
-
-        fi = 0;
-        wi = 0;
-        if ii <= n_fluid && jj > n_fluid
-            fi = ii;
-            wi = jj - n_fluid;
-        elseif jj <= n_fluid && ii > n_fluid
-            fi = jj;
-            wi = ii - n_fluid;
-        end
-
-        if fi == 0 || wi < 1 || wi > n_boundary
-            continue;
-        end
-
-        if wi <= n_bottom
-            eta = y(fi);
-            if eta <= 0
-                continue;
-            end
-        else
-            eta = y(fi) - H;
-            if eta >= 0
-                continue;
-            end
-        end
-
-        rho_f = max(rho(fi), 1e-12);
-        w = mass * W_pair(k) / rho_f;
-        if w <= 0
-            continue;
-        end
-
-        u = vx(fi);
-        s0(wi) = s0(wi) + w;
-        s0_sq(wi) = s0_sq(wi) + w^2;
-        s1(wi) = s1(wi) + w * eta;
-        s2(wi) = s2(wi) + w * eta^2;
-        su(wi) = su(wi) + w * u;
-        seta_u(wi) = seta_u(wi) + w * eta * u;
-        su2(wi) = su2(wi) + w * u^2;
-        neighbor_count(wi) = neighbor_count(wi) + 1;
-    end
-
-    wall_grad_raw = zeros(n_boundary, 1);
-    n_eff = zeros(n_boundary, 1);
-    eta2_hat = zeros(n_boundary, 1);
-    fit_cond = zeros(n_boundary, 1);
-    sse_rel = ones(n_boundary, 1);
-
-    valid_neff = s0_sq > eps_conf;
-    n_eff(valid_neff) = s0(valid_neff).^2 ./ s0_sq(valid_neff);
-
-    valid_eta2 = s0 > eps_conf;
-    eta2_hat(valid_eta2) = s2(valid_eta2) ./ s0(valid_eta2);
-
-    for wi = 1:n_boundary
-        D = s0(wi) * s2(wi) - s1(wi)^2;
-        fit_cond(wi) = clamp01_scalar(D / (s0(wi) * s2(wi) + eps_conf));
-        if D > eps_conf
-            a = (su(wi) * s2(wi) - seta_u(wi) * s1(wi)) / D;
-            b = (s0(wi) * seta_u(wi) - s1(wi) * su(wi)) / D;
-            sse = su2(wi) - 2*a*su(wi) - 2*b*seta_u(wi) + ...
-                  a^2*s0(wi) + 2*a*b*s1(wi) + b^2*s2(wi);
-            sse = max(0, sse);
-            sse_rel(wi) = sse / (su2(wi) + eps_conf);
-            wall_grad_raw(wi) = b;
-        else
-            wall_grad_raw(wi) = 0;
-        end
-    end
-
-    sign_expect = ones(n_boundary, 1);
-    sign_expect(n_bottom+1:end) = -1;
-    c_neff = clamp01_vec((n_eff - neff_lo) ./ max(neff_hi - neff_lo, eps_conf));
-    c_eta = clamp01_vec((eta2_hat - eta2_lo) ./ max(eta2_hi - eta2_lo, eps_conf));
-    c_fit = clamp01_vec((fit_cond - cond_lo) ./ max(cond_hi - cond_lo, eps_conf));
-    c_res = exp(-max(0, sse_rel) ./ max(r0, eps_conf));
-    x_sign = k_sign .* sign_expect .* wall_grad_raw;
-    x_sign = max(min(x_sign, 50), -50);
-    c_sign = 1 ./ (1 + exp(-x_sign));
-    confidence_raw = c_neff .* c_eta .* c_fit .* c_res .* c_sign;
-
-    wall_quality = [neighbor_count, n_eff, eta2_hat, fit_cond, sse_rel, c_sign, confidence_raw];
-end
-
-function y = clamp01_vec(x)
-% 向量裁剪到 [0,1]
-    y = min(max(x, 0), 1);
-end
-
-function y = clamp01_scalar(x)
-% 标量裁剪到 [0,1]
-    y = min(max(x, 0), 1);
+    vx(idx_bottom) = -d_bottom .* dudy_bottom;
+    vx(idx_top)    =  d_top    .* dudy_top;
 end
 
 function vx = update_wall_velocity_unified(vx, n_fluid, n_bottom, n_top, ...
     fluid_layer_id, layer_particle_count, n_layers_fluid, ...
     wall_bottom_k1, wall_bottom_k2, wall_bottom_w1, wall_bottom_w2, ...
     wall_top_k1, wall_top_k2, wall_top_w1, wall_top_w2, ...
-    wall_bc_type, d_bottom, d_top, y_layer1_bottom, y_layer1_top, ...
-    H, mu, rho0, wm_kappa, wm_E, wm_max_iter, wm_tol)
+    wall_bc_type)
 % 统一壁面速度更新函数
-% 支持三种模式: dirichlet / neumann_laminar / neumann_wallmodel
+% 支持模式: dirichlet / contact_only
 
     % 计算各层平均速度（所有模式共用）
     vx_fluid = vx(1:n_fluid);
@@ -1287,93 +756,14 @@ function vx = update_wall_velocity_unified(vx, n_fluid, n_bottom, n_top, ...
             vx(idx_bottom) = -vx_mirror_bottom;
             vx(idx_top)    = -vx_mirror_top;
 
-        case 'neumann_laminar'
-            % 层流 Neumann BC: 近壁单点差分估计 du/dy
-            u_layer1_bottom = vx_layer(1);      % 近壁第1层速度（下壁面）
-            u_layer1_top    = vx_layer(end);     % 近壁第1层速度（上壁面）
-
-            % du/dy 带符号: 下壁面 > 0, 上壁面 < 0
-            dudy_bottom = u_layer1_bottom / y_layer1_bottom;
-            dudy_top    = -u_layer1_top / y_layer1_top;
-
-            % u_ghost = u_wall - d * (du/dy), u_wall = 0
-            % 下壁面虚粒子在 y=-d: u(-d) = 0 + (-d)*dudy = -d*dudy
-            % 上壁面虚粒子在 y=H+d: u(H+d) = 0 + d*dudy = d*dudy (dudy<0, 所以u_ghost<0)
-            vx(idx_bottom) = -d_bottom .* dudy_bottom;
-            vx(idx_top)    =  d_top    .* dudy_top;
-
-        case 'neumann_wallmodel'
-            % 壁面模型 Neumann BC: 对数律不动点迭代
-            u_layer1_bottom = vx_layer(1);
-            u_layer1_top    = vx_layer(end);
-            nu = mu / rho0;
-
-            % 下壁面: du/dy > 0
-            abs_dudy_bottom = wall_model_dudy(abs(u_layer1_bottom), ...
-                y_layer1_bottom, nu, mu, rho0, wm_kappa, wm_E, wm_max_iter, wm_tol);
-            dudy_bottom = +abs_dudy_bottom;
-
-            % 上壁面: du/dy < 0
-            abs_dudy_top = wall_model_dudy(abs(u_layer1_top), ...
-                y_layer1_top, nu, mu, rho0, wm_kappa, wm_E, wm_max_iter, wm_tol);
-            dudy_top = -abs_dudy_top;
-
-            % u_ghost = u_wall + (±d) * (du/dy), u_wall = 0
-            vx(idx_bottom) = -d_bottom .* dudy_bottom;
-            vx(idx_top)    =  d_top    .* dudy_top;
-
         case 'contact_only'
             % 仅接触力: 虚粒子速度恒为0, 不施加切应力条件
-            % 壁面切应力完全由 SPH 粘性项 visc*(vx_fluid - 0) 自然产生
             vx(idx_bottom) = 0;
             vx(idx_top)    = 0;
 
         otherwise
             error('未知的壁面边界条件类型: %s', wall_bc_type);
     end
-end
-
-function abs_dudy = wall_model_dudy(u_ref, y_ref, nu, mu, rho0, ...
-    kappa, E, max_iter, tol)
-% 对数律壁面模型: 不动点迭代求 |du/dy|_wall
-% 输入: u_ref - 参考点速度绝对值
-%        y_ref - 参考点到壁面距离
-%        nu    - 运动粘度
-%        mu    - 动力粘度
-%        rho0  - 参考密度
-%        kappa - von Kármán 常数 (0.41)
-%        E     - 对数律常数 (9.8)
-% 输出: abs_dudy - |du/dy|_wall 的绝对值
-
-    if u_ref < 1e-15 || y_ref < 1e-15
-        abs_dudy = 0;
-        return;
-    end
-
-    % 初始猜测: 粘性子层公式 u+ = y+ → u_tau = sqrt(nu * u_ref / y_ref)
-    u_tau = sqrt(nu * u_ref / y_ref);
-
-    for iter = 1:max_iter
-        u_tau_old = u_tau;
-        y_plus = u_tau * y_ref / nu;
-
-        if y_plus <= 11.1
-            % 粘性子层: u+ = y+ → u_tau = sqrt(nu * u_ref / y_ref)
-            u_tau = sqrt(nu * u_ref / y_ref);
-        else
-            % 对数层: u+ = (1/κ) * ln(E * y+)
-            u_tau = u_ref * kappa / log(E * y_plus);
-        end
-
-        % 收敛检查
-        if abs(u_tau - u_tau_old) / max(u_tau, 1e-15) < tol
-            break;
-        end
-    end
-
-    % τ_w = ρ * u_τ², |du/dy|_wall = τ_w / μ
-    tau_w = rho0 * u_tau^2;
-    abs_dudy = tau_w / mu;
 end
 
 function write_vtp(filepath, x, y, vx, vy, rho, p, ptype, time, step, np)

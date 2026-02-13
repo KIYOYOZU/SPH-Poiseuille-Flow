@@ -7,7 +7,7 @@
  *   mex -R2018a -O COMPFLAGS="$COMPFLAGS /openmp" sph_step_mex.c
  *
  * Usage:
- *   [ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs, wall_grad_raw, wall_quality] = sph_step_mex(
+ *   [ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs, bl_grad, bl_diag] = sph_step_mex(
  *       x, y, vx, vy, n_total, n_fluid, L, r_cut,
  *       y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, n_cells,
  *       h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, do_shepard, n_bottom, H);
@@ -22,12 +22,11 @@
 #include <omp.h>
 #endif
 
-static double clamp01(double v)
-{
-    if (v < 0.0) return 0.0;
-    if (v > 1.0) return 1.0;
-    return v;
-}
+/*
+ * 直接力求和方案：累积壁面粒子受到的总粘性力，计算剪切应力
+ * τ = F_wall / L, du/dy = τ / μ
+ * 不再需要边界层检测和线性拟合
+ */
 
 static void counting_sort(const int *cell_id, int n, int n_cells,
                           int *sorted_particles, int *cell_start, int *cell_end)
@@ -142,6 +141,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
     int n_bottom;
     double H;
     int n_boundary;
+    double dx;  /* 粒子间距，用于计算壁面长度 */
+    double mass_wall;  /* 壁面粒子有效质量 */
 
     double h_inv;
     double h_sq_001;
@@ -178,14 +179,16 @@ void mexFunction(int nlhs, mxArray *plhs[],
     double *p_out;
     double *vx_xsph_out;
     double *vy_xsph_out;
-    double *wall_grad_raw_out;
-    double *wall_quality_out;
+    double *bl_grad_out;
+    double *bl_diag_out;
+    double *wall_force_bottom;  /* 下壁面粒子受到的总粘性力 (x方向) */
+    double *wall_force_top;     /* 上壁面粒子受到的总粘性力 (x方向) */
 
     static const int stencil_dx[5] = {0, 1, -1, 0, 1};
     static const int stencil_dy[5] = {0, 0, 1, 1, 1};
 
-    if (nrhs != 25)
-        mexErrMsgIdAndTxt("SPH:nrhs", "Requires 25 input arguments");
+    if (nrhs != 27)
+        mexErrMsgIdAndTxt("SPH:nrhs", "Requires 27 input arguments");
     if (nlhs != 9)
         mexErrMsgIdAndTxt("SPH:nlhs", "Requires 9 output arguments");
 
@@ -214,6 +217,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
     do_shepard = (int)mxGetScalar(prhs[22]);
     n_bottom = (int)mxGetScalar(prhs[23]);
     H = mxGetScalar(prhs[24]);
+    dx = mxGetScalar(prhs[25]);
+    mass_wall = mxGetScalar(prhs[26]);
     n_boundary = n_total - n_fluid;
     if (n_bottom < 0 || n_bottom > n_boundary)
         mexErrMsgIdAndTxt("SPH:n_bottom", "n_bottom out of valid range");
@@ -230,8 +235,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
     plhs[4] = mxCreateDoubleMatrix(n_total, 1, mxREAL);
     plhs[5] = mxCreateDoubleMatrix(n_total, 1, mxREAL);
     plhs[6] = mxCreateDoubleScalar(0.0);
-    plhs[7] = mxCreateDoubleMatrix(n_boundary, 1, mxREAL);
-    plhs[8] = mxCreateDoubleMatrix(n_boundary, 7, mxREAL);
+    plhs[7] = mxCreateDoubleMatrix(2, 1, mxREAL);
+    plhs[8] = mxCreateDoubleMatrix(8, 1, mxREAL);  /* 改为 8×1 */
 
     ax_out = mxGetDoubles(plhs[0]);
     ay_out = mxGetDoubles(plhs[1]);
@@ -239,18 +244,16 @@ void mexFunction(int nlhs, mxArray *plhs[],
     p_out = mxGetDoubles(plhs[3]);
     vx_xsph_out = mxGetDoubles(plhs[4]);
     vy_xsph_out = mxGetDoubles(plhs[5]);
-    wall_grad_raw_out = mxGetDoubles(plhs[7]);
-    wall_quality_out = mxGetDoubles(plhs[8]);
+    bl_grad_out = mxGetDoubles(plhs[7]);
+    bl_diag_out = mxGetDoubles(plhs[8]);
 
     memset(ax_out, 0, n_total * sizeof(double));
     memset(ay_out, 0, n_total * sizeof(double));
     memset(rho_out, 0, n_total * sizeof(double));
     memset(vx_xsph_out, 0, n_total * sizeof(double));
     memset(vy_xsph_out, 0, n_total * sizeof(double));
-    if (n_boundary > 0) {
-        memset(wall_grad_raw_out, 0, n_boundary * sizeof(double));
-        memset(wall_quality_out, 0, (size_t)n_boundary * 7 * sizeof(double));
-    }
+    memset(bl_grad_out, 0, 2 * sizeof(double));
+    memset(bl_diag_out, 0, 8 * sizeof(double));
 
     cell_id = (int *)mxMalloc(n_total * sizeof(int));
     sorted_particles = (int *)mxMalloc(n_total * sizeof(int));
@@ -271,6 +274,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
     t_r = NULL;
     t_count = NULL;
     t_cap = NULL;
+    wall_force_bottom = NULL;
+    wall_force_top = NULL;
 
     {
         int i;
@@ -579,293 +584,15 @@ void mexFunction(int nlhs, mxArray *plhs[],
             p_out[i] = cs_sq * (rho_out[i] - rho0);
     }
 
-    if (n_boundary > 0) {
-        const double eps_q = 1e-12;
-        const double neff_lo = 1.2;
-        const double neff_hi = 2.2;
-        const double eta2_lo_mul = 0.006;
-        const double eta2_hi_mul = 0.03;
-        const double cond_lo = 0.02;
-        const double cond_hi = 0.20;
-        const double r0 = 0.12;
-        const double k_sign = 6.0;
-        const double eta2_lo = eta2_lo_mul * h * h;
-        const double eta2_hi = eta2_hi_mul * h * h;
-
-        double *s0 = (double *)calloc((size_t)n_boundary, sizeof(double));
-        double *s0_sq = (double *)calloc((size_t)n_boundary, sizeof(double));
-        double *s1 = (double *)calloc((size_t)n_boundary, sizeof(double));
-        double *s2 = (double *)calloc((size_t)n_boundary, sizeof(double));
-        double *su = (double *)calloc((size_t)n_boundary, sizeof(double));
-        double *seta_u = (double *)calloc((size_t)n_boundary, sizeof(double));
-        double *su2 = (double *)calloc((size_t)n_boundary, sizeof(double));
-        double *neighbor_count = (double *)calloc((size_t)n_boundary, sizeof(double));
-
-        if (n_threads > 1) {
-            double **s0_priv = (double **)malloc((size_t)n_threads * sizeof(double *));
-            double **s0_sq_priv = (double **)malloc((size_t)n_threads * sizeof(double *));
-            double **s1_priv = (double **)malloc((size_t)n_threads * sizeof(double *));
-            double **s2_priv = (double **)malloc((size_t)n_threads * sizeof(double *));
-            double **su_priv = (double **)malloc((size_t)n_threads * sizeof(double *));
-            double **seta_u_priv = (double **)malloc((size_t)n_threads * sizeof(double *));
-            double **su2_priv = (double **)malloc((size_t)n_threads * sizeof(double *));
-            double **neighbor_count_priv = (double **)malloc((size_t)n_threads * sizeof(double *));
-            int t;
-
-            for (t = 0; t < n_threads; t++) {
-                s0_priv[t] = (double *)calloc((size_t)n_boundary, sizeof(double));
-                s0_sq_priv[t] = (double *)calloc((size_t)n_boundary, sizeof(double));
-                s1_priv[t] = (double *)calloc((size_t)n_boundary, sizeof(double));
-                s2_priv[t] = (double *)calloc((size_t)n_boundary, sizeof(double));
-                su_priv[t] = (double *)calloc((size_t)n_boundary, sizeof(double));
-                seta_u_priv[t] = (double *)calloc((size_t)n_boundary, sizeof(double));
-                su2_priv[t] = (double *)calloc((size_t)n_boundary, sizeof(double));
-                neighbor_count_priv[t] = (double *)calloc((size_t)n_boundary, sizeof(double));
-            }
-
-#ifdef _OPENMP
-            #pragma omp parallel
-#endif
-            {
-                int tid = 0;
-                double *my_s0;
-                double *my_s0_sq;
-                double *my_s1;
-                double *my_s2;
-                double *my_su;
-                double *my_seta_u;
-                double *my_su2;
-                double *my_neighbor_count;
-                int k;
-
-#ifdef _OPENMP
-                tid = omp_get_thread_num();
-#endif
-                my_s0 = s0_priv[tid];
-                my_s0_sq = s0_sq_priv[tid];
-                my_s1 = s1_priv[tid];
-                my_s2 = s2_priv[tid];
-                my_su = su_priv[tid];
-                my_seta_u = seta_u_priv[tid];
-                my_su2 = su2_priv[tid];
-                my_neighbor_count = neighbor_count_priv[tid];
-
-#ifdef _OPENMP
-                #pragma omp for schedule(static)
-#endif
-                for (k = 0; k < total_pairs; k++) {
-                    int ii = pair_i[k];
-                    int jj = pair_j[k];
-                    int fi = -1;
-                    int wi = -1;
-                    double eta;
-                    double rho_f;
-                    double w;
-                    double u;
-
-                    if (ii < n_fluid && jj >= n_fluid) {
-                        fi = ii;
-                        wi = jj - n_fluid;
-                    } else if (jj < n_fluid && ii >= n_fluid) {
-                        fi = jj;
-                        wi = ii - n_fluid;
-                    } else {
-                        continue;
-                    }
-
-                    if (wi < 0 || wi >= n_boundary)
-                        continue;
-
-                    if (wi < n_bottom) {
-                        eta = y[fi];
-                        if (eta <= 0.0)
-                            continue;
-                    } else {
-                        eta = y[fi] - H;
-                        if (eta >= 0.0)
-                            continue;
-                    }
-
-                    rho_f = rho_out[fi];
-                    if (rho_f <= eps_q)
-                        continue;
-
-                    w = mass * W_pair[k] / rho_f;
-                    if (w <= 0.0)
-                        continue;
-
-                    u = vx[fi];
-                    my_s0[wi] += w;
-                    my_s0_sq[wi] += w * w;
-                    my_s1[wi] += w * eta;
-                    my_s2[wi] += w * eta * eta;
-                    my_su[wi] += w * u;
-                    my_seta_u[wi] += w * eta * u;
-                    my_su2[wi] += w * u * u;
-                    my_neighbor_count[wi] += 1.0;
-                }
-            }
-
-            {
-                int wi;
-                for (wi = 0; wi < n_boundary; wi++) {
-                    for (t = 0; t < n_threads; t++) {
-                        s0[wi] += s0_priv[t][wi];
-                        s0_sq[wi] += s0_sq_priv[t][wi];
-                        s1[wi] += s1_priv[t][wi];
-                        s2[wi] += s2_priv[t][wi];
-                        su[wi] += su_priv[t][wi];
-                        seta_u[wi] += seta_u_priv[t][wi];
-                        su2[wi] += su2_priv[t][wi];
-                        neighbor_count[wi] += neighbor_count_priv[t][wi];
-                    }
-                }
-            }
-
-            for (t = 0; t < n_threads; t++) {
-                free(s0_priv[t]);
-                free(s0_sq_priv[t]);
-                free(s1_priv[t]);
-                free(s2_priv[t]);
-                free(su_priv[t]);
-                free(seta_u_priv[t]);
-                free(su2_priv[t]);
-                free(neighbor_count_priv[t]);
-            }
-            free(s0_priv);
-            free(s0_sq_priv);
-            free(s1_priv);
-            free(s2_priv);
-            free(su_priv);
-            free(seta_u_priv);
-            free(su2_priv);
-            free(neighbor_count_priv);
-        } else {
-            int k;
-            for (k = 0; k < total_pairs; k++) {
-                int ii = pair_i[k];
-                int jj = pair_j[k];
-                int fi = -1;
-                int wi = -1;
-                double eta;
-                double rho_f;
-                double w;
-                double u;
-
-                if (ii < n_fluid && jj >= n_fluid) {
-                    fi = ii;
-                    wi = jj - n_fluid;
-                } else if (jj < n_fluid && ii >= n_fluid) {
-                    fi = jj;
-                    wi = ii - n_fluid;
-                } else {
-                    continue;
-                }
-
-                if (wi < 0 || wi >= n_boundary)
-                    continue;
-
-                if (wi < n_bottom) {
-                    eta = y[fi];
-                    if (eta <= 0.0)
-                        continue;
-                } else {
-                    eta = y[fi] - H;
-                    if (eta >= 0.0)
-                        continue;
-                }
-
-                rho_f = rho_out[fi];
-                if (rho_f <= eps_q)
-                    continue;
-
-                w = mass * W_pair[k] / rho_f;
-                if (w <= 0.0)
-                    continue;
-
-                u = vx[fi];
-                s0[wi] += w;
-                s0_sq[wi] += w * w;
-                s1[wi] += w * eta;
-                s2[wi] += w * eta * eta;
-                su[wi] += w * u;
-                seta_u[wi] += w * eta * u;
-                su2[wi] += w * u * u;
-                neighbor_count[wi] += 1.0;
-            }
+    /* 分配壁面力数组（必须在力循环之前） */
+    if (n_boundary > 0 && n_fluid > 0) {
+        wall_force_bottom = (double *)calloc((size_t)n_bottom, sizeof(double));
+        wall_force_top = (double *)calloc((size_t)(n_boundary - n_bottom), sizeof(double));
+        if (wall_force_bottom == NULL || wall_force_top == NULL) {
+            if (wall_force_bottom) free(wall_force_bottom);
+            if (wall_force_top) free(wall_force_top);
+            mexErrMsgIdAndTxt("SPH:alloc", "Failed to allocate wall force buffers");
         }
-
-        {
-            int wi;
-            for (wi = 0; wi < n_boundary; wi++) {
-                double sign_expect = (wi < n_bottom) ? 1.0 : -1.0;
-                double n_eff = 0.0;
-                double eta2_hat = 0.0;
-                double fit_cond = 0.0;
-                double sse_rel = 1.0;
-                double c_sign = 0.5;
-                double confidence_raw = 0.0;
-                double b_raw = 0.0;
-                double s0_i = s0[wi];
-                double s0_sq_i = s0_sq[wi];
-                double s1_i = s1[wi];
-                double s2_i = s2[wi];
-                double su_i = su[wi];
-                double seta_u_i = seta_u[wi];
-                double su2_i = su2[wi];
-                double D = s0_i * s2_i - s1_i * s1_i;
-                double fit_denom = s0_i * s2_i + eps_q;
-
-                if (s0_sq_i > eps_q)
-                    n_eff = (s0_i * s0_i) / s0_sq_i;
-                if (s0_i > eps_q)
-                    eta2_hat = s2_i / s0_i;
-                if (fit_denom > eps_q) {
-                    fit_cond = D / fit_denom;
-                    fit_cond = clamp01(fit_cond);
-                }
-
-                if (D > eps_q) {
-                    double a = (su_i * s2_i - seta_u_i * s1_i) / D;
-                    double b = (s0_i * seta_u_i - s1_i * su_i) / D;
-                    double sse = su2_i - 2.0 * a * su_i - 2.0 * b * seta_u_i +
-                                 a * a * s0_i + 2.0 * a * b * s1_i + b * b * s2_i;
-                    if (sse < 0.0) sse = 0.0;
-                    sse_rel = sse / (su2_i + eps_q);
-                    b_raw = b;
-                }
-
-                {
-                    double c_neff = clamp01((n_eff - neff_lo) / (neff_hi - neff_lo));
-                    double c_eta = clamp01((eta2_hat - eta2_lo) / (eta2_hi - eta2_lo));
-                    double c_fit = clamp01((fit_cond - cond_lo) / (cond_hi - cond_lo));
-                    double c_res = exp(-sse_rel / r0);
-                    double x_sign = k_sign * sign_expect * b_raw;
-                    if (x_sign > 50.0) x_sign = 50.0;
-                    if (x_sign < -50.0) x_sign = -50.0;
-                    c_sign = 1.0 / (1.0 + exp(-x_sign));
-                    confidence_raw = c_neff * c_eta * c_fit * c_res * c_sign;
-                }
-
-                wall_grad_raw_out[wi] = b_raw;
-                wall_quality_out[wi] = neighbor_count[wi];
-                wall_quality_out[wi + n_boundary] = n_eff;
-                wall_quality_out[wi + 2 * n_boundary] = eta2_hat;
-                wall_quality_out[wi + 3 * n_boundary] = fit_cond;
-                wall_quality_out[wi + 4 * n_boundary] = sse_rel;
-                wall_quality_out[wi + 5 * n_boundary] = c_sign;
-                wall_quality_out[wi + 6 * n_boundary] = confidence_raw;
-            }
-        }
-
-        free(s0);
-        free(s0_sq);
-        free(s1);
-        free(s2);
-        free(su);
-        free(seta_u);
-        free(su2);
-        free(neighbor_count);
     }
 
     if (n_threads > 1) {
@@ -873,13 +600,33 @@ void mexFunction(int nlhs, mxArray *plhs[],
         double **ay_priv = (double **)malloc((size_t)n_threads * sizeof(double *));
         double **vx_xsph_priv = (double **)malloc((size_t)n_threads * sizeof(double *));
         double **vy_xsph_priv = (double **)malloc((size_t)n_threads * sizeof(double *));
+        double **wall_force_bottom_priv = NULL;
+        double **wall_force_top_priv = NULL;
         int t;
+
+        if (ax_priv == NULL || ay_priv == NULL || vx_xsph_priv == NULL || vy_xsph_priv == NULL)
+            mexErrMsgIdAndTxt("SPH:alloc", "Failed to allocate per-thread force buffers");
 
         for (t = 0; t < n_threads; t++) {
             ax_priv[t] = (double *)calloc((size_t)n_total, sizeof(double));
             ay_priv[t] = (double *)calloc((size_t)n_total, sizeof(double));
             vx_xsph_priv[t] = (double *)calloc((size_t)n_total, sizeof(double));
             vy_xsph_priv[t] = (double *)calloc((size_t)n_total, sizeof(double));
+            if (ax_priv[t] == NULL || ay_priv[t] == NULL || vx_xsph_priv[t] == NULL || vy_xsph_priv[t] == NULL)
+                mexErrMsgIdAndTxt("SPH:alloc", "Failed to allocate per-thread force slices");
+        }
+
+        if (wall_force_bottom != NULL && wall_force_top != NULL) {
+            wall_force_bottom_priv = (double **)malloc((size_t)n_threads * sizeof(double *));
+            wall_force_top_priv = (double **)malloc((size_t)n_threads * sizeof(double *));
+            if (wall_force_bottom_priv == NULL || wall_force_top_priv == NULL)
+                mexErrMsgIdAndTxt("SPH:alloc", "Failed to allocate per-thread wall force buffers");
+            for (t = 0; t < n_threads; t++) {
+                wall_force_bottom_priv[t] = (double *)calloc((size_t)n_bottom, sizeof(double));
+                wall_force_top_priv[t] = (double *)calloc((size_t)(n_boundary - n_bottom), sizeof(double));
+                if (wall_force_bottom_priv[t] == NULL || wall_force_top_priv[t] == NULL)
+                    mexErrMsgIdAndTxt("SPH:alloc", "Failed to allocate per-thread wall force slices");
+            }
         }
 
 #ifdef _OPENMP
@@ -891,6 +638,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
             double *my_ay;
             double *my_vxx;
             double *my_vyy;
+            double *my_wall_force_bottom = NULL;
+            double *my_wall_force_top = NULL;
             int k;
 
 #ifdef _OPENMP
@@ -900,6 +649,10 @@ void mexFunction(int nlhs, mxArray *plhs[],
             my_ay = ay_priv[tid];
             my_vxx = vx_xsph_priv[tid];
             my_vyy = vy_xsph_priv[tid];
+            if (wall_force_bottom_priv != NULL && wall_force_top_priv != NULL) {
+                my_wall_force_bottom = wall_force_bottom_priv[tid];
+                my_wall_force_top = wall_force_top_priv[tid];
+            }
 
 #ifdef _OPENMP
             #pragma omp for schedule(static)
@@ -928,23 +681,59 @@ void mexFunction(int nlhs, mxArray *plhs[],
                 ex = dx_pair[k] / r_safe;
                 ey = dy_pair[k] / r_safe;
 
+                /* 判断壁面粒子 */
+                int is_wall_i = (ii >= n_fluid);
+                int is_wall_j = (jj >= n_fluid);
+                int is_wall_pair = (is_wall_i || is_wall_j);
+
+                /* 速度差：壁面交互时乘以 2.0（镜像补偿，切向+法向） */
+                double mirror_factor = is_wall_pair ? 2.0 : 1.0;
+                dvx = mirror_factor * (vx[ii] - vx[jj]);
+                dvy = mirror_factor * (vy[ii] - vy[jj]);
+
+                /* 压力项：统一使用 mass（密度计算中已统一） */
                 press_coef = -mass * (p_i / (rho_i * rho_i) + p_j / (rho_j * rho_j)) * dWdr_pair[k];
 
-                dvx = vx[ii] - vx[jj];
-                dvy = vy[ii] - vy[jj];
-                visc_common = mass * 2.0 * mu / (rho_i * rho_j) *
+                /* 粘性力：壁面交互时使用 mass_wall */
+                double mass_visc = is_wall_pair ? mass_wall : mass;
+                visc_common = mass_visc * 2.0 * mu / (rho_i * rho_j) *
                     (r_pair[k] * dWdr_pair[k]) / (r_pair[k] * r_pair[k] + h_sq_001);
+
+                /* 累积壁面粒子受到的粘性力 (x方向) */
+                if (my_wall_force_bottom != NULL && my_wall_force_top != NULL) {
+                    if (ii < n_fluid && jj >= n_fluid) {
+                        /* 流体粒子 ii 与壁面粒子 jj 相互作用 */
+                        int wi = jj - n_fluid;
+                        double visc_fx = visc_common * dvx;  /* 单位质量的力（加速度） */
+                        double real_force = mass * visc_fx;  /* 真实的力 = 质量 × 加速度 */
+                        if (wi < n_bottom) {
+                            my_wall_force_bottom[wi] -= real_force;  /* 下壁面 */
+                        } else {
+                            my_wall_force_top[wi - n_bottom] -= real_force;  /* 上壁面 */
+                        }
+                    } else if (jj < n_fluid && ii >= n_fluid) {
+                        /* 流体粒子 jj 与壁面粒子 ii 相互作用 */
+                        int wi = ii - n_fluid;
+                        double visc_fx = visc_common * dvx;
+                        double real_force = mass * visc_fx;
+                        if (wi < n_bottom) {
+                            my_wall_force_bottom[wi] += real_force;  /* 下壁面 */
+                        } else {
+                            my_wall_force_top[wi - n_bottom] += real_force;  /* 上壁面 */
+                        }
+                    }
+                }
 
                 fx = press_coef * ex + visc_common * dvx;
                 fy = press_coef * ey + visc_common * dvy;
 
                 my_ax[ii] += fx;
                 my_ay[ii] += fy;
-                my_ax[jj] -= fx;
+                my_ax[jj] -= fx;  /* 牛顿第三定律（对称） */
                 my_ay[jj] -= fy;
 
                 rho_avg_inv = 2.0 / (rho_i + rho_j);
-                dvx_x = mass * (vx[jj] - vx[ii]) * W_pair[k] * rho_avg_inv;
+                dvx_x = mass * (vx[jj] - vx[ii]) * W_pair[k] * rho_avg_inv;  /* 统一使用 mass */
                 dvy_x = mass * (vy[jj] - vy[ii]) * W_pair[k] * rho_avg_inv;
                 my_vxx[ii] += dvx_x;
                 my_vyy[ii] += dvy_x;
@@ -963,6 +752,18 @@ void mexFunction(int nlhs, mxArray *plhs[],
                     vy_xsph_out[i] += vy_xsph_priv[t][i];
                 }
             }
+            if (wall_force_bottom_priv != NULL && wall_force_top_priv != NULL) {
+                for (i = 0; i < n_bottom; i++) {
+                    for (t = 0; t < n_threads; t++) {
+                        wall_force_bottom[i] += wall_force_bottom_priv[t][i];
+                    }
+                }
+                for (i = 0; i < (n_boundary - n_bottom); i++) {
+                    for (t = 0; t < n_threads; t++) {
+                        wall_force_top[i] += wall_force_top_priv[t][i];
+                    }
+                }
+            }
         }
 
         for (t = 0; t < n_threads; t++) {
@@ -970,11 +771,15 @@ void mexFunction(int nlhs, mxArray *plhs[],
             free(ay_priv[t]);
             free(vx_xsph_priv[t]);
             free(vy_xsph_priv[t]);
+            if (wall_force_bottom_priv != NULL) free(wall_force_bottom_priv[t]);
+            if (wall_force_top_priv != NULL) free(wall_force_top_priv[t]);
         }
         free(ax_priv);
         free(ay_priv);
         free(vx_xsph_priv);
         free(vy_xsph_priv);
+        if (wall_force_bottom_priv != NULL) free(wall_force_bottom_priv);
+        if (wall_force_top_priv != NULL) free(wall_force_top_priv);
     } else {
         int k;
         for (k = 0; k < total_pairs; k++) {
@@ -1001,23 +806,59 @@ void mexFunction(int nlhs, mxArray *plhs[],
             ex = dx_pair[k] / r_safe;
             ey = dy_pair[k] / r_safe;
 
+            /* 判断壁面粒子 */
+            int is_wall_i = (ii >= n_fluid);
+            int is_wall_j = (jj >= n_fluid);
+            int is_wall_pair = (is_wall_i || is_wall_j);
+
+            /* 速度差：壁面交互时乘以 2.0（镜像补偿，切向+法向） */
+            double mirror_factor = is_wall_pair ? 2.0 : 1.0;
+            dvx = mirror_factor * (vx[ii] - vx[jj]);
+            dvy = mirror_factor * (vy[ii] - vy[jj]);
+
+            /* 压力项：统一使用 mass（密度计算中已统一） */
             press_coef = -mass * (p_i / (rho_i * rho_i) + p_j / (rho_j * rho_j)) * dWdr_pair[k];
 
-            dvx = vx[ii] - vx[jj];
-            dvy = vy[ii] - vy[jj];
-            visc_common = mass * 2.0 * mu / (rho_i * rho_j) *
+            /* 粘性力：壁面交互时使用 mass_wall */
+            double mass_visc = is_wall_pair ? mass_wall : mass;
+            visc_common = mass_visc * 2.0 * mu / (rho_i * rho_j) *
                 (r_pair[k] * dWdr_pair[k]) / (r_pair[k] * r_pair[k] + h_sq_001);
+
+            /* 累积壁面粒子受到的粘性力 (x方向) */
+            if (wall_force_bottom != NULL && wall_force_top != NULL) {
+                if (ii < n_fluid && jj >= n_fluid) {
+                    /* 流体粒子 ii 与壁面粒子 jj 相互作用 */
+                    int wi = jj - n_fluid;
+                    double visc_fx = visc_common * dvx;  /* 单位质量的力（加速度） */
+                    double real_force = mass * visc_fx;  /* 真实的力 = 质量 × 加速度 */
+                    if (wi < n_bottom) {
+                        wall_force_bottom[wi] -= real_force;  /* 下壁面 */
+                    } else {
+                        wall_force_top[wi - n_bottom] -= real_force;  /* 上壁面 */
+                    }
+                } else if (jj < n_fluid && ii >= n_fluid) {
+                    /* 流体粒子 jj 与壁面粒子 ii 相互作用 */
+                    int wi = ii - n_fluid;
+                    double visc_fx = visc_common * dvx;
+                    double real_force = mass * visc_fx;
+                    if (wi < n_bottom) {
+                        wall_force_bottom[wi] += real_force;  /* 下壁面 */
+                    } else {
+                        wall_force_top[wi - n_bottom] += real_force;  /* 上壁面 */
+                    }
+                }
+            }
 
             fx = press_coef * ex + visc_common * dvx;
             fy = press_coef * ey + visc_common * dvy;
 
             ax_out[ii] += fx;
             ay_out[ii] += fy;
-            ax_out[jj] -= fx;
+            ax_out[jj] -= fx;  /* 牛顿第三定律（对称） */
             ay_out[jj] -= fy;
 
             rho_avg_inv = 2.0 / (rho_i + rho_j);
-            dvx_x = mass * (vx[jj] - vx[ii]) * W_pair[k] * rho_avg_inv;
+            dvx_x = mass * (vx[jj] - vx[ii]) * W_pair[k] * rho_avg_inv;  /* 统一使用 mass */
             dvy_x = mass * (vy[jj] - vy[ii]) * W_pair[k] * rho_avg_inv;
             vx_xsph_out[ii] += dvx_x;
             vy_xsph_out[ii] += dvy_x;
@@ -1025,6 +866,63 @@ void mexFunction(int nlhs, mxArray *plhs[],
             vy_xsph_out[jj] -= dvy_x;
         }
     }
+
+    /* 计算壁面剪切应力和速度梯度 */
+    if (wall_force_bottom != NULL && wall_force_top != NULL) {
+        double total_force_bottom = 0.0;
+        double total_force_top = 0.0;
+        double L_bottom_total = 0.0;
+        double L_top_total = 0.0;
+        double tau_bottom;
+        double tau_top;
+        double dudy_bottom;
+        double dudy_top;
+        int i;
+
+        /* 累积所有虚粒子层的力 */
+        for (i = 0; i < n_bottom; i++) {
+            total_force_bottom += wall_force_bottom[i];
+            L_bottom_total += dx;  /* 累积所有虚粒子的总长度 */
+        }
+        for (i = 0; i < (n_boundary - n_bottom); i++) {
+            total_force_top += wall_force_top[i];
+            L_top_total += dx;
+        }
+
+        /* 计算剪切应力: τ = F / L_total（使用所有虚粒子的总长度） */
+        tau_bottom = (L_bottom_total > 0.0) ? (total_force_bottom / L_bottom_total) : 0.0;
+        tau_top = (L_top_total > 0.0) ? (total_force_top / L_top_total) : 0.0;
+
+        /* 计算速度梯度: du/dy = τ / μ */
+        dudy_bottom = (mu > 0.0) ? (tau_bottom / mu) : 0.0;
+        dudy_top = (mu > 0.0) ? (-tau_top / mu) : 0.0;  /* 上壁面法向相反 */
+
+        /* 输出结果 */
+        bl_grad_out[0] = dudy_bottom;
+        bl_grad_out[1] = dudy_top;
+
+        /* 诊断信息: [n_bottom, L_total, tau_bottom, 0] */
+        bl_diag_out[0] = (double)n_bottom;
+        bl_diag_out[1] = L_bottom_total;  /* 所有虚粒子的总长度 */
+        bl_diag_out[2] = tau_bottom;
+        bl_diag_out[3] = 0.0;
+
+        /* 诊断信息: [n_top, L_total, tau_top, 0] */
+        bl_diag_out[4] = (double)(n_boundary - n_bottom);
+        bl_diag_out[5] = L_top_total;  /* 所有虚粒子的总长度 */
+        bl_diag_out[6] = tau_top;
+        bl_diag_out[7] = 0.0;
+    } else {
+        int i;
+        bl_grad_out[0] = 0.0;
+        bl_grad_out[1] = 0.0;
+        for (i = 0; i < 8; i++) {
+            bl_diag_out[i] = 0.0;
+        }
+    }
+
+    if (wall_force_bottom != NULL) free(wall_force_bottom);
+    if (wall_force_top != NULL) free(wall_force_top);
 
     {
         int i;
