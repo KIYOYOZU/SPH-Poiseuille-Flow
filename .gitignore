@@ -14,10 +14,11 @@ build/
 *.asv
 *.patch
 tmp.*
+logs/
 
 # 文档草稿
-AGENTS.md
-CLAUDE.md
+*.md
+!README.md
 
 # MATLAB 自动生成
 *.autosave
