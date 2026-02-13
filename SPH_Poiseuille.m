@@ -35,10 +35,22 @@ end
 if need_compile
     fprintf('编译 %s -> %s ...\n', 'sph_step_mex.c', step_mex_name);
     try
-        mex('-R2018a', '-O', 'COMPFLAGS="$COMPFLAGS /openmp"', ...
+        % 跨平台编译参数检测
+        if ispc
+            % Windows: MSVC
+            openmp_flag = 'COMPFLAGS="$COMPFLAGS /openmp"';
+        else
+            % Linux/macOS: GCC/Clang
+            openmp_flag = 'CFLAGS="$CFLAGS -fopenmp" LDFLAGS="$LDFLAGS -fopenmp"';
+        end
+
+        mex('-R2018a', '-O', openmp_flag, ...
             '-output', step_mex_name, '-outdir', build_dir, step_src);
         fprintf('编译成功! 输出到: %s\n', build_dir);
     catch e
+        fprintf('MEX 编译失败: %s\n', e.message);
+        fprintf('提示: 请检查 MEX 编译器配置（运行 mex -setup）\n');
+        fprintf('      当前版本已移除 MATLAB 回退实现，必须使用 MEX。\n');
         error('MEX 编译失败，无法继续: %s', e.message);
     end
 end
@@ -135,6 +147,12 @@ if ~isempty(env_wall_bc)
 end
 
 fprintf('壁面边界条件: %s\n', wall_bc_type);
+
+% 边界条件类型映射（传递给 MEX）
+wall_bc_mode_map = containers.Map(...
+    {'dirichlet', 'neumann_laminar', 'neumann_wallmodel', 'contact_only'}, ...
+    [0, 1, 2, 3]);
+wall_bc_mode = wall_bc_mode_map(wall_bc_type);
 
 %% 粒子初始化
 fprintf('\n初始化粒子...\n');
@@ -282,7 +300,7 @@ end
 [ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs, bl_grad, bl_diag] = ...
     feval(step_mex_name, x, y, vx, vy, n_total, n_fluid, L, r_cut, ...
     y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, n_cells, ...
-    h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, 0, n_bottom, H, dx, mass_wall);
+    h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, 0, n_bottom, H, dx, mass_wall, wall_bc_mode);
 
 % 用初始 SPH 密度修正质量（消除核函数离散求和的系统偏差）
 rho0_sph = mean(rho(1:n_fluid));
@@ -290,13 +308,15 @@ fprintf('SPH 初始密度: mean=%.4f, min=%.4f, max=%.4f (理论 rho0=%.1f)\n', 
     rho0_sph, min(rho(1:n_fluid)), max(rho(1:n_fluid)), rho0);
 mass_correction = rho0 / rho0_sph;
 mass = mass * mass_correction;
-fprintf('质量修正因子: %.4f, 修正后 mass=%.6e\n', mass_correction, mass);
+mass_wall = mass_wall * mass_correction;  % 同步修正
+fprintf('质量修正: 因子=%.4f, mass=%.6e, mass_wall=%.6e, 比值=%.1f\n', ...
+    mass_correction, mass, mass_wall, mass_wall/mass);
 
 % 重新计算初始力（使用修正后的 mass）
 [ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs, bl_grad, bl_diag] = ...
     feval(step_mex_name, x, y, vx, vy, n_total, n_fluid, L, r_cut, ...
     y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, n_cells, ...
-    h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, 0, n_bottom, H, dx, mass_wall);
+    h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, 0, n_bottom, H, dx, mass_wall, wall_bc_mode);
 fprintf('修正后 SPH 密度: mean=%.4f\n', mean(rho(1:n_fluid)));
 
 fprintf('初始邻居对数: %d (平均每粒子 %.1f 个邻居)\n', n_pairs, 2*n_pairs/n_total);
@@ -364,17 +384,24 @@ while t_current < t_end
     [ax, ay, rho, p, vx_xsph, vy_xsph, n_pairs, bl_grad, bl_diag] = ...
         feval(step_mex_name, x, y, vx, vy, n_total, n_fluid, L, r_cut, ...
         y_min_domain, n_cell_x, n_cell_y, cell_size_x, cell_size_y, n_cells, ...
-        h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, double(do_shepard), n_bottom, H, dx, mass_wall);
+        h, alpha_kernel, W_self, mass, cs, rho0, mu, gx, double(do_shepard), n_bottom, H, dx, mass_wall, wall_bc_mode);
 
     if is_dynamic_neumann
         dudy_bottom_raw = bl_grad(1);
         dudy_top_raw = bl_grad(2);
 
+        % 理论最大梯度（基于解析解）
+        dudy_max_theory = abs(dpdx) * H / (2 * mu);  % = u_max / (H/2)
+        dudy_clamp = 2.0 * dudy_max_theory;  % 允许 2 倍理论值
+
+        % 条件更新：仅当梯度符号正确且有足够邻居时才更新
         if dudy_bottom_raw > 0 && bl_diag(1) >= 2
+            dudy_bottom_raw = min(dudy_bottom_raw, dudy_clamp);  % 饱和保护
             bl_dudy_bottom_ema = (1 - bl_ema_alpha) * bl_dudy_bottom_ema + ...
                                  bl_ema_alpha * dudy_bottom_raw;
         end
         if dudy_top_raw < 0 && bl_diag(5) >= 2
+            dudy_top_raw = max(dudy_top_raw, -dudy_clamp);  % 饱和保护
             bl_dudy_top_ema = (1 - bl_ema_alpha) * bl_dudy_top_ema + ...
                               bl_ema_alpha * dudy_top_raw;
         end
@@ -723,8 +750,15 @@ function vx = apply_neumann_boundary_layer(vx, n_fluid, n_bottom, n_top, ...
     idx_bottom = (n_fluid+1):(n_fluid+n_bottom);
     idx_top = (n_fluid+n_bottom+1):(n_fluid+n_bottom+n_top);
 
-    vx(idx_bottom) = -d_bottom .* dudy_bottom;
-    vx(idx_top)    =  d_top    .* dudy_top;
+    % 物理上界：壁面速度不应超过近壁流体速度
+    v_max_fluid = max(abs(vx(1:n_fluid)));
+    v_clamp = 1.5 * v_max_fluid;  % 允许 1.5 倍流体最大速度
+
+    vx_bottom = -d_bottom .* dudy_bottom;
+    vx_top = d_top .* dudy_top;
+
+    vx(idx_bottom) = sign(vx_bottom) .* min(abs(vx_bottom), v_clamp);
+    vx(idx_top) = sign(vx_top) .* min(abs(vx_top), v_clamp);
 end
 
 function vx = update_wall_velocity_unified(vx, n_fluid, n_bottom, n_top, ...

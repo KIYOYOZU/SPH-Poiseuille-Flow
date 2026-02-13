@@ -143,6 +143,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     int n_boundary;
     double dx;  /* 粒子间距，用于计算壁面长度 */
     double mass_wall;  /* 壁面粒子有效质量 */
+    int wall_bc_mode;  /* 边界条件类型：0=dirichlet, 1=neumann_laminar, 2=neumann_wallmodel, 3=contact_only */
 
     double h_inv;
     double h_sq_001;
@@ -187,8 +188,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
     static const int stencil_dx[5] = {0, 1, -1, 0, 1};
     static const int stencil_dy[5] = {0, 0, 1, 1, 1};
 
-    if (nrhs != 27)
-        mexErrMsgIdAndTxt("SPH:nrhs", "Requires 27 input arguments");
+    if (nrhs != 28)
+        mexErrMsgIdAndTxt("SPH:nrhs", "Requires 28 input arguments");
     if (nlhs != 9)
         mexErrMsgIdAndTxt("SPH:nlhs", "Requires 9 output arguments");
 
@@ -219,6 +220,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     H = mxGetScalar(prhs[24]);
     dx = mxGetScalar(prhs[25]);
     mass_wall = mxGetScalar(prhs[26]);
+    wall_bc_mode = (int)mxGetScalar(prhs[27]);
     n_boundary = n_total - n_fluid;
     if (n_bottom < 0 || n_bottom > n_boundary)
         mexErrMsgIdAndTxt("SPH:n_bottom", "n_bottom out of valid range");
@@ -686,10 +688,29 @@ void mexFunction(int nlhs, mxArray *plhs[],
                 int is_wall_j = (jj >= n_fluid);
                 int is_wall_pair = (is_wall_i || is_wall_j);
 
-                /* 速度差：壁面交互时乘以 2.0（镜像补偿，切向+法向） */
-                double mirror_factor = is_wall_pair ? 2.0 : 1.0;
-                dvx = mirror_factor * (vx[ii] - vx[jj]);
-                dvy = mirror_factor * (vy[ii] - vy[jj]);
+                /* 根据边界条件类型选择镜像因子 */
+                double mirror_factor_tangent = 1.0;
+                double mirror_factor_normal = 2.0;
+
+                if (is_wall_pair) {
+                    if (wall_bc_mode == 0) {  /* dirichlet: 切向+法向都镜像 */
+                        mirror_factor_tangent = 2.0;
+                        mirror_factor_normal = 2.0;
+                    } else if (wall_bc_mode >= 1 && wall_bc_mode <= 2) {  /* neumann: 仅法向镜像 */
+                        mirror_factor_tangent = 1.0;
+                        mirror_factor_normal = 2.0;
+                    } else {  /* contact_only: 无镜像 */
+                        mirror_factor_tangent = 1.0;
+                        mirror_factor_normal = 1.0;
+                    }
+                } else {
+                    mirror_factor_tangent = 1.0;
+                    mirror_factor_normal = 1.0;
+                }
+
+                /* 速度差：切向和法向分别处理 */
+                dvx = mirror_factor_tangent * (vx[ii] - vx[jj]);  /* 切向（x 方向） */
+                dvy = mirror_factor_normal * (vy[ii] - vy[jj]);   /* 法向（y 方向） */
 
                 /* 压力项：统一使用 mass（密度计算中已统一） */
                 press_coef = -mass * (p_i / (rho_i * rho_i) + p_j / (rho_j * rho_j)) * dWdr_pair[k];
@@ -811,10 +832,29 @@ void mexFunction(int nlhs, mxArray *plhs[],
             int is_wall_j = (jj >= n_fluid);
             int is_wall_pair = (is_wall_i || is_wall_j);
 
-            /* 速度差：壁面交互时乘以 2.0（镜像补偿，切向+法向） */
-            double mirror_factor = is_wall_pair ? 2.0 : 1.0;
-            dvx = mirror_factor * (vx[ii] - vx[jj]);
-            dvy = mirror_factor * (vy[ii] - vy[jj]);
+            /* 根据边界条件类型选择镜像因子 */
+            double mirror_factor_tangent = 1.0;
+            double mirror_factor_normal = 2.0;
+
+            if (is_wall_pair) {
+                if (wall_bc_mode == 0) {  /* dirichlet: 切向+法向都镜像 */
+                    mirror_factor_tangent = 2.0;
+                    mirror_factor_normal = 2.0;
+                } else if (wall_bc_mode >= 1 && wall_bc_mode <= 2) {  /* neumann: 仅法向镜像 */
+                    mirror_factor_tangent = 1.0;
+                    mirror_factor_normal = 2.0;
+                } else {  /* contact_only: 无镜像 */
+                    mirror_factor_tangent = 1.0;
+                    mirror_factor_normal = 1.0;
+                }
+            } else {
+                mirror_factor_tangent = 1.0;
+                mirror_factor_normal = 1.0;
+            }
+
+            /* 速度差：切向和法向分别处理 */
+            dvx = mirror_factor_tangent * (vx[ii] - vx[jj]);  /* 切向（x 方向） */
+            dvy = mirror_factor_normal * (vy[ii] - vy[jj]);   /* 法向（y 方向） */
 
             /* 压力项：统一使用 mass（密度计算中已统一） */
             press_coef = -mass * (p_i / (rho_i * rho_i) + p_j / (rho_j * rho_j)) * dWdr_pair[k];
