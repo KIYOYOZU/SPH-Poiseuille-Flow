@@ -1,13 +1,14 @@
 /*
  * sph_physics_mex.c
- * SPH physics operators with mode dispatch.
+ * SPH 物理算子 MEX 实现，支持 OpenMP 并行加速。
+ * 通过模式字符串分发到不同物理计算：
  *
  * Modes:
- *   - density_correction
- *   - viscous_force
- *   - transport_correction
- *   - integration_1st
- *   - integration_2nd
+ *   - density_correction   : 密度重初始化 + 核梯度修正矩阵 B
+ *   - viscous_force        : 层流粘性力（含壁面无滑移镜像速度）
+ *   - transport_correction : 传输速度修正（抑制张力不稳定性）
+ *   - integration_1st      : 第一阶段积分（密度演化 + 压力 + 位置半步 + 压力梯度力）
+ *   - integration_2nd      : 第二阶段积分（位置修正 + 密度散度修正）
  *
  * Build with OpenMP:
  *   Windows (MSVC): mex -R2018a -O COMPFLAGS="$COMPFLAGS /openmp" sph_physics_mex.c
@@ -24,6 +25,7 @@
 
 #define EPS_REG 1e-8
 
+/* 2D 三次样条核函数在 r=0 处的值 W(0,h) */
 static double cubic_kernel_w0(double h)
 {
     const double pi = 3.14159265358979323846;
@@ -65,6 +67,8 @@ static void get_pair_data(const mxArray *arr_i, const mxArray *arr_j,
     *n_pairs = ni;
 }
 
+/* 密度重初始化 + 核梯度修正矩阵 B
+ * 输出: rho(密度), Vol(粒子体积), B(2x2修正矩阵，展平为4列) */
 static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
     const double *pair_i;
@@ -340,6 +344,8 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
     mxFree(A22);
 }
 
+/* 粘性力计算：基于修正核梯度的层流粘性模型
+ * 壁面粒子使用镜像速度实现无滑移边界条件 */
 static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
     const double *pair_i;
@@ -497,6 +503,8 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
     mxFree(acc_y);
 }
 
+/* 传输速度修正：抑制粒子聚集/空洞（张力不稳定性）
+ * 通过额外的位置修正项保持粒子分布均匀 */
 static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
     const double *pair_i;
@@ -631,6 +639,8 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
     mxFree(inc_y);
 }
 
+/* 第一阶段积分（Verlet 分裂格式前半步）：
+ * 密度连续性方程演化 → 弱可压缩状态方程求压力 → 位置半步推进 → 压力梯度力 */
 static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
     const double *pair_i;
@@ -862,6 +872,8 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
     mxFree(diss);
 }
 
+/* 第二阶段积分（Verlet 分裂格式后半步）：
+ * 位置修正（完成全步推进）+ 密度散度修正（抑制密度振荡） */
 static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
     const double *pair_i;

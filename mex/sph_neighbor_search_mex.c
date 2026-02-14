@@ -1,25 +1,27 @@
 /*
  * sph_neighbor_search_mex.c
- * Neighbor search with periodic boundary in x-direction for 2D SPH.
+ * 基于链表法的 2D SPH 邻居搜索（X 方向周期性边界），支持 OpenMP 并行。
+ *
+ * 算法：将粒子分配到 2D 网格单元（cell_size = 2h），
+ *       遍历相邻 9 个单元查找截断半径内的粒子对。
+ *       流体-流体对使用最小镜像约定处理 X 方向周期性。
  *
  * Usage:
  *   [pair_i, pair_j, dx, dy, r, W, dW] = sph_neighbor_search_mex(pos, n_fluid, n_total, h, DL)
  *
  * Inputs:
- *   pos      : [n_total x 2] particle positions
- *   n_fluid  : number of fluid particles
- *   n_total  : total number of particles
- *   h        : smoothing length
- *   DL       : periodic length in x direction
+ *   pos      : [n_total x 2] 粒子位置
+ *   n_fluid  : 流体粒子数
+ *   n_total  : 总粒子数（流体 + 壁面）
+ *   h        : 光滑长度
+ *   DL       : X 方向周期性域长度
  *
  * Outputs:
- *   pair_i, pair_j : 1-based particle indices
- *   dx, dy         : displacement x_i - x_j
- *                    (fluid-fluid pairs use periodic minimum image in x;
- *                     fluid-wall pairs use physical distance without x wrapping)
- *   r              : pair distance
- *   W              : cubic spline kernel value
- *   dW             : dW/dr
+ *   pair_i, pair_j : 粒子对索引（1-based）
+ *   dx, dy         : 位移分量 x_i - x_j（流体对含周期性修正）
+ *   r              : 粒子对距离
+ *   W              : 三次样条核函数值
+ *   dW             : 核函数径向导数 dW/dr
  */
 
 #include "mex.h"
@@ -38,6 +40,7 @@ typedef struct {
     mwSize capacity;
 } PairBuffer;
 
+/* 2D 三次样条核函数及其径向导数 */
 static void cubic_kernel_2d(double r, double h, double *W, double *dW)
 {
     const double pi = 3.14159265358979323846;
@@ -57,6 +60,7 @@ static void cubic_kernel_2d(double r, double h, double *W, double *dW)
     }
 }
 
+/* 动态数组初始化（存储粒子对数据） */
 static void init_pair_buffer(PairBuffer *buf, mwSize initial_capacity)
 {
     buf->count = 0;
@@ -70,6 +74,7 @@ static void init_pair_buffer(PairBuffer *buf, mwSize initial_capacity)
     buf->dW = (double *)mxMalloc(initial_capacity * sizeof(double));
 }
 
+/* 容量不足时 2 倍扩容 */
 static void ensure_capacity(PairBuffer *buf)
 {
     mwSize new_capacity;

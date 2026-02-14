@@ -1,17 +1,20 @@
 %% SPH_Poiseuille.m
-% SPHinXsys 风格 2D Poiseuille 流动（MATLAB + 双 MEX）
+% 基于 SPH（光滑粒子流体动力学）方法的二维平板泊肃叶流动模拟
+% 采用弱可压缩 SPH + 双层时间步进（对流步 + 声学步）
+% 计算加速：C/MEX + OpenMP（邻居搜索与物理计算分离）
 
 clear; clc; close all;
 
-fprintf('SPH Poiseuille Flow (SPHinXsys-aligned)\n');
+fprintf('SPH Poiseuille Flow Simulation\n');
 
+% 路径初始化
 project_dir = fileparts(mfilename('fullpath'));
 if isempty(project_dir)
     project_dir = pwd;
 end
 
-build_dir = fullfile(project_dir, 'build');
-mex_dir = fullfile(project_dir, 'mex');
+build_dir = fullfile(project_dir, 'build');     % MEX 编译输出目录
+mex_dir = fullfile(project_dir, 'mex');         % MEX C 源码目录
 config_path = fullfile(project_dir, 'config.ini');
 restart_path = fullfile(project_dir, 'restart.mat');
 result_png = fullfile(project_dir, 'SPH_Poiseuille_result.png');
@@ -30,27 +33,30 @@ ensure_mex_compiled(fullfile(mex_dir, 'sph_physics_mex.c'), physics_mex_name, bu
 %% S2: INI 读取 + 参数计算
 cfg = parse_ini(config_path);
 
-DL = get_ini_numeric(cfg, 'physical', 'DL');
-DH = get_ini_numeric(cfg, 'physical', 'DH');
-dp = get_ini_numeric(cfg, 'physical', 'dp');
-rho0 = get_ini_numeric(cfg, 'physical', 'rho0');
-mu = get_ini_numeric(cfg, 'physical', 'mu');
-U_f = get_ini_numeric(cfg, 'physical', 'U_f');
-c_f = get_ini_numeric(cfg, 'physical', 'c_f');
+% 物理参数
+DL = get_ini_numeric(cfg, 'physical', 'DL');       % 流体域长度（X方向，周期性）
+DH = get_ini_numeric(cfg, 'physical', 'DH');       % 流体域高度（Y方向，壁面）
+dp = get_ini_numeric(cfg, 'physical', 'dp');       % 粒子间距
+rho0 = get_ini_numeric(cfg, 'physical', 'rho0');   % 参考密度
+mu = get_ini_numeric(cfg, 'physical', 'mu');       % 动力粘度
+U_f = get_ini_numeric(cfg, 'physical', 'U_f');     % 特征速度
+c_f = get_ini_numeric(cfg, 'physical', 'c_f');     % 人工声速因子
 
+% 仿真控制参数
 t_end = get_ini_numeric(cfg, 'simulation', 'end_time');
 output_interval = get_ini_numeric(cfg, 'simulation', 'output_interval');
 sort_interval = round(get_ini_numeric(cfg, 'simulation', 'sort_interval'));
 restart_from_file = round(get_ini_numeric(cfg, 'simulation', 'restart_from_file'));
 
-gravity_g = 12.0 * mu * U_f / (rho0 * DH^2);
-U_max = 1.5 * U_f;
-h = 1.3 * dp;
-BW = 4.0 * dp; %#ok<NASGU>
-periodic_buffer = BW;
-p0 = rho0 * c_f^2;
-inv_sigma0 = dp^2;
-nu = mu / rho0;
+% 派生参数
+gravity_g = 12.0 * mu * U_f / (rho0 * DH^2);  % 等效体积力（驱动泊肃叶流）
+U_max = 1.5 * U_f;                              % 最大速度估计
+h = 1.3 * dp;                                   % 光滑长度
+BW = 4.0 * dp; %#ok<NASGU>                      % 壁面层厚度
+periodic_buffer = BW;                            % 周期性缓冲层宽度
+p0 = rho0 * c_f^2;                              % 参考压力（弱可压缩状态方程）
+inv_sigma0 = dp^2;                               % 核函数归一化因子的倒数
+nu = mu / rho0;                                  % 运动粘度
 
 fprintf('参数: DL=%.3f, DH=%.3f, dp=%.4f, h=%.4f\n', DL, DH, dp, h);
 fprintf('参数: rho0=%.3f, mu=%.3f, U_f=%.6f, c_f=%.3f\n', rho0, mu, U_f, c_f);
@@ -63,13 +69,14 @@ if sort_interval <= 0
 end
 
 %% S3: 粒子初始化
+% 流体粒子：均匀网格分布在 [0,DL] x [0,DH] 域内
 x_fluid = (dp/2 : dp : DL - dp/2)';
 y_fluid = (dp/2 : dp : DH - dp/2)';
 [X_fluid, Y_fluid] = meshgrid(x_fluid, y_fluid);
 pos_fluid = [X_fluid(:), Y_fluid(:)];
 n_fluid = size(pos_fluid, 1);
 
-% 壁面粒子：仅在流体域 [0, DL] 范围内生成，避免周期性边界冲突
+% 壁面虚粒子：上下各 4 层，用于施加无滑移边界条件
 x_wall = (dp/2 : dp : DL - dp/2)';
 x_bottom = [];
 y_bottom = [];
@@ -145,73 +152,89 @@ if restart_from_file && exist(restart_path, 'file')
 end
 
 %% S5: 初始邻居搜索 + 密度求和 + 核梯度修正
+% 建立粒子对列表，计算核函数值和梯度，用于后续物理量插值
 [pair_i, pair_j, dx_ij, dy_ij, r_ij, W_ij, dW_ij] = feval(neighbor_mex_name, pos, n_fluid, n_total, h, DL);
+% 密度重初始化 + 核梯度修正矩阵 B（提高边界附近精度）
 [rho, Vol, B] = feval(physics_mex_name, 'density_correction', ...
     pair_i, pair_j, dx_ij, dy_ij, r_ij, W_ij, dW_ij, ...
     mass, n_fluid, n_total, rho0, h, inv_sigma0);
 p(1:n_fluid) = p0 * (rho(1:n_fluid) ./ rho0 - 1.0);
 p(n_fluid+1:end) = 0.0;
 
-%% S6: 主循环（双层时间步进）
+%% S6: 主循环（双层时间步进：外层对流步 + 内层声学步）
+% 外层：计算粘性力、传输修正、对流时间步长 Dt
+% 内层：在 Dt 内以声学时间步 dt 推进压力-速度耦合
 while t < t_end - 1e-12
     target_time = min(t + output_interval, t_end);
 
     while t < target_time - 1e-12
         step = step + 1;
 
+        % 对流时间步长（基于粒子速度、加速度和粘性约束）
         Dt = advection_time_step(vel(1:n_fluid, :), force(1:n_fluid, :), force_prior(1:n_fluid, :), ...
             mass(1:n_fluid), h, mu, rho0, U_f);
         Dt = min(Dt, target_time - t);
         Dt = min(Dt, t_end - t);
 
+        % 密度重初始化 + 核梯度修正
         [rho, Vol, B] = feval(physics_mex_name, 'density_correction', ...
             pair_i, pair_j, dx_ij, dy_ij, r_ij, W_ij, dW_ij, ...
             mass, n_fluid, n_total, rho0, h, inv_sigma0);
 
+        % 粘性力计算（含壁面无滑移镜像速度）
         viscous_force = feval(physics_mex_name, 'viscous_force', ...
             pair_i, pair_j, dx_ij, dy_ij, r_ij, dW_ij, ...
             vel, Vol, B, mu, h, n_fluid, n_total, mass, wall_vel);
         force_prior = viscous_force;
-        force_prior(1:n_fluid, 1) = force_prior(1:n_fluid, 1) + mass(1:n_fluid) * gravity_g;
+        force_prior(1:n_fluid, 1) = force_prior(1:n_fluid, 1) + mass(1:n_fluid) * gravity_g;  % 叠加体积力
 
+        % 传输速度修正（抑制张力不稳定性）
         pos = feval(physics_mex_name, 'transport_correction', ...
             pair_i, pair_j, dx_ij, dy_ij, r_ij, dW_ij, ...
             Vol, B, pos, h, n_fluid, n_total);
 
         pos = bounding_from_wall(pos, n_fluid, DH, dp);
 
+        % 内层声学子步循环
         relaxation_time = 0.0;
         while relaxation_time < Dt - 1e-12
+            % 声学时间步长（CFL 条件：基于声速 + 粒子速度）
             dt = acoustic_time_step(vel(1:n_fluid, :), c_f, h, Dt - relaxation_time);
 
+            % 第一阶段积分：密度演化 + 压力更新 + 位置半步推进 + 压力梯度力
             [rho, p, pos, force, drho_dt] = feval(physics_mex_name, 'integration_1st', ...
                 pair_i, pair_j, dx_ij, dy_ij, r_ij, dW_ij, ...
                 Vol, B, rho, mass, pos, vel, drho_dt, force_prior, dt, ...
                 n_fluid, n_total, rho0, p0, c_f, wall_vel);
 
+            % 速度更新：合力（粘性力 + 压力梯度力）/ 质量 * dt
             acc_fluid = (force_prior(1:n_fluid, :) + force(1:n_fluid, :)) ./ mass(1:n_fluid);
             vel(1:n_fluid, :) = vel(1:n_fluid, :) + acc_fluid * dt;
 
+            % 第二阶段积分：位置修正 + 密度散度修正
             [pos, drho_dt, ~] = feval(physics_mex_name, 'integration_2nd', ...
                 pair_i, pair_j, dx_ij, dy_ij, r_ij, dW_ij, ...
                 Vol, rho, pos, vel, dt, n_fluid, n_total, wall_vel);
-            rho(1:n_fluid) = rho(1:n_fluid) + drho_dt(1:n_fluid) * (dt / 2.0);
+            rho(1:n_fluid) = rho(1:n_fluid) + drho_dt(1:n_fluid) * (dt / 2.0);  % 密度半步修正
 
+            % X 方向周期性边界处理
             [pos, wrapped] = periodic_bounding(pos, n_fluid, DL, periodic_buffer);
             if wrapped
                 [pair_i, pair_j, dx_ij, dy_ij, r_ij, W_ij, dW_ij] = feval(neighbor_mex_name, pos, n_fluid, n_total, h, DL);
             end
 
-            % BoundingFromWall: SPHinXsys 风格壁面防穿透
+            % BoundingFromWall: 壁面防穿透
             pos = bounding_from_wall(pos, n_fluid, DH, dp);
 
             relaxation_time = relaxation_time + dt;
         end
 
+        % 对流步结束：周期性边界 + 壁面防穿透 + 壁面速度重置
         [pos, ~] = periodic_bounding(pos, n_fluid, DL, periodic_buffer);
         pos = bounding_from_wall(pos, n_fluid, DH, dp);
         vel(n_fluid+1:end, :) = wall_vel(n_fluid+1:end, :);
 
+        % 定期按空间网格排序粒子（提升缓存命中率）
         if mod(step, sort_interval) == 0 && step ~= 1
             [pos, vel, rho, mass, wall_vel, drho_dt, force_prior, force, p, Vol, B] = sort_particles_by_cell( ...
                 pos, vel, rho, mass, wall_vel, drho_dt, force_prior, force, p, Vol, B, n_fluid, DL, h);
@@ -242,6 +265,7 @@ while t < t_end - 1e-12
 end
 
 %% S7: 后处理与验证
+% 提取流体粒子速度剖面，与泊肃叶流解析解对比
 fluid_pos = pos(1:n_fluid, :);
 fluid_pos(:, 1) = mod(fluid_pos(:, 1), DL);
 fluid_vel = vel(1:n_fluid, :);
@@ -405,6 +429,8 @@ function sig = create_config_signature(DL, DH, dp, rho0, mu, U_f, c_f, t_end, ou
 end
 
 function Dt = advection_time_step(vel, force, force_prior, mass, h, mu, rho0, U_f)
+% 对流时间步长：综合考虑速度、加速度和粘性扩散约束
+% Dt = 0.25 * h / max(v_max, sqrt(4h*a_max), viscous_speed)
     viscous_speed = mu / (rho0 * h);
     speed_ref = max(viscous_speed, U_f);
 
@@ -421,6 +447,7 @@ function Dt = advection_time_step(vel, force, force_prior, mass, h, mu, rho0, U_
 end
 
 function dt = acoustic_time_step(vel, c_f, h, remain)
+% 声学时间步长：CFL 条件 dt = 0.6 * h / (c + |v|_max)，不超过剩余时间
     signal = c_f + vecnorm(vel, 2, 2);
     max_signal = max(signal);
     max_signal = max(max_signal, 1e-12);
@@ -430,6 +457,8 @@ end
 
 function [pos, vel, rho, mass, wall_vel, drho_dt, force_prior, force, p, Vol, B] = sort_particles_by_cell( ...
     pos, vel, rho, mass, wall_vel, drho_dt, force_prior, force, p, Vol, B, n_fluid, DL, h)
+% 按空间网格对流体粒子排序，壁面粒子保持不变
+% 目的：提升邻居搜索的缓存局部性
 
     n_total = size(pos, 1);
     if n_fluid <= 0 || n_fluid >= n_total
@@ -453,6 +482,7 @@ function [pos, vel, rho, mass, wall_vel, drho_dt, force_prior, force, p, Vol, B]
 end
 
 function idx = sort_subset_indices(pos_sub, DL, h)
+% 按 2D 网格单元排序粒子索引（先 Y 后 X），用于空间局部性优化
     n = size(pos_sub, 1);
     if n == 0
         idx = zeros(0, 1);
@@ -467,6 +497,7 @@ function idx = sort_subset_indices(pos_sub, DL, h)
 end
 
 function [pos, wrapped] = periodic_bounding(pos, n_fluid, DL, buffer_width)
+% X 方向周期性边界：超出 [−buffer, DL+buffer] 的粒子平移回域内
     x = pos(1:n_fluid, 1);
     wrapped = false;
     left_mask = (x < -buffer_width);
@@ -485,6 +516,7 @@ function [pos, wrapped] = periodic_bounding(pos, n_fluid, DL, buffer_width)
 end
 
 function [y_mid, u_mean] = compute_binned_profile_mean(y_values, u_values, y_min, y_max, n_bins)
+% 将粒子按 Y 坐标分箱，计算每个箱内的平均 X 速度（用于速度剖面）
     edges = linspace(y_min, y_max, n_bins + 1);
     y_mid = 0.5 * (edges(1:end-1) + edges(2:end));
     y_mid = y_mid(:);
@@ -497,12 +529,12 @@ function [y_mid, u_mean] = compute_binned_profile_mean(y_values, u_values, y_min
 end
 
 function save_restart(restart_path, config_signature, state)
+% 保存重启文件（包含完整粒子状态和配置签名，用于断点续算）
     save(restart_path, 'state', 'config_signature', '-v7.3');
 end
 
 function pos = bounding_from_wall(pos, n_fluid, DH, dp)
-% BoundingFromWall (SPHinXsys 风格)
-% 粒子到壁面距离 < 0.25*dp 时，弹回到 0.5*dp 处
+% 壁面防穿透：粒子到壁面距离 < 0.25*dp 时，弹回到 0.5*dp 处
     dist_min = 0.25 * dp;
     half_dp = 0.5 * dp;
     y = pos(1:n_fluid, 2);

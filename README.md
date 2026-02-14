@@ -40,9 +40,9 @@ $$u(y) = \frac{g}{2\nu} y(H - y)$$
 - **传输修正：** Transport Velocity Correction（抑制数值扩散）
 - **边界条件：**
   - X 方向：周期性边界（缓冲层宽度 4dp），fluid-wall 对同样做周期最小像距
-  - Y 方向：4 层壁面虚粒子（镜像速度无滑移）+ BoundingFromWall 防穿透（SPHinXsys 风格）
+  - Y 方向：4 层壁面虚粒子（镜像速度无滑移）+ 壁面防穿透
 
-### 架构特点（SPHinXsys 风格）
+### 架构特点
 - **配置驱动：** 所有参数通过 `config.ini` 配置
 - **Restart 机制：** 支持从断点续算（带配置签名验证）
 - **粒子排序：** 定期按 Cell ID 排序提升缓存命中率
