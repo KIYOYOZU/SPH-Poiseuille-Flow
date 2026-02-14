@@ -8,11 +8,19 @@
  *   - transport_correction
  *   - integration_1st
  *   - integration_2nd
+ *
+ * Build with OpenMP:
+ *   Windows (MSVC): mex -R2018a -O COMPFLAGS="$COMPFLAGS /openmp" sph_physics_mex.c
+ *   Linux/macOS:    mex -R2018a -O CFLAGS="$CFLAGS -fopenmp" LDFLAGS="$LDFLAGS -fopenmp" sph_physics_mex.c
  */
 
 #include "mex.h"
 #include <math.h>
 #include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #define EPS_REG 1e-8
 
@@ -83,7 +91,7 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
     double *A12;
     double *A21;
     double *A22;
-    mwSize k;
+    int k;  /* Changed from mwSize to int for OpenMP compatibility */
     int i;
 
     require_count(nrhs == 14, "SPH:Physics:density:nrhs",
@@ -141,6 +149,9 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
         sigma_inner[i] = W0;
     }
 
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (k = 0; k < n_pairs; ++k) {
         int ii = (int)pair_i[k] - 1;
         int jj = (int)pair_j[k] - 1;
@@ -151,9 +162,18 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
         }
 
         if (jj < n_fluid) {
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             sigma_inner[ii] += wk;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             sigma_inner[jj] += wk;
         } else {
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             sigma_contact[ii] += wk * (mass[jj] / rho0);
         }
     }
@@ -180,6 +200,9 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
         Vol_out[i] = mass[i] / rhoi;
     }
 
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (k = 0; k < n_pairs; ++k) {
         int ii = (int)pair_i[k] - 1;
         int jj = (int)pair_j[k] - 1;
@@ -200,21 +223,57 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
             double fxj = dWk * vj;
             double fxi = dWk * vi;
 
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             A11[ii] -= dx[k] * (fxj * ex);
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             A12[ii] -= dx[k] * (fxj * ey);
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             A21[ii] -= dy[k] * (fxj * ex);
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             A22[ii] -= dy[k] * (fxj * ey);
 
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             A11[jj] -= dx[k] * (fxi * ex);
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             A12[jj] -= dx[k] * (fxi * ey);
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             A21[jj] -= dy[k] * (fxi * ex);
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             A22[jj] -= dy[k] * (fxi * ey);
         } else {
             double vj = Vol_out[jj];
             double fxj = dWk * vj;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             A11[ii] -= dx[k] * (fxj * ex);
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             A12[ii] -= dx[k] * (fxj * ey);
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             A21[ii] -= dy[k] * (fxj * ex);
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             A22[ii] -= dy[k] * (fxj * ey);
         }
     }
@@ -308,7 +367,7 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
     double *force_y;
     double *acc_x;
     double *acc_y;
-    mwSize k;
+    int k;  /* Changed from mwSize to int for OpenMP compatibility */
 
     require_count(nrhs == 16, "SPH:Physics:viscous:nrhs",
                   "viscous_force expects 16 inputs after mode.");
@@ -351,6 +410,9 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
     acc_x = (double *)mxCalloc((mwSize)n_total, sizeof(double));
     acc_y = (double *)mxCalloc((mwSize)n_total, sizeof(double));
 
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (k = 0; k < n_pairs; ++k) {
         int ii = (int)pair_i[k] - 1;
         int jj = (int)pair_j[k] - 1;
@@ -387,9 +449,21 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
             double coeff_i = eBe * mu * dWk * Vol[jj] / denom;
             double coeff_j = eBe * mu * dWk * Vol[ii] / denom;
 
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             acc_x[ii] += coeff_i * dvx;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             acc_y[ii] += coeff_i * dvy;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             acc_x[jj] -= coeff_j * dvx;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             acc_y[jj] -= coeff_j * dvy;
         } else {
             double eBe = ex * (b11i * ex + b12i * ey) + ey * (b21i * ex + b22i * ey);
@@ -398,7 +472,13 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
             double dvy = vel_y[ii] - wall_vel_y[jj];
             double coeff = 4.0 * eBe * mu * dWk * Vol[jj] / denom;
 
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             acc_x[ii] += coeff * dvx;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             acc_y[ii] += coeff * dvy;
         }
     }
@@ -439,7 +519,7 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
     double *pos_out_y;
     double *inc_x;
     double *inc_y;
-    mwSize k;
+    int k;  /* Changed from mwSize to int for OpenMP compatibility */
 
     require_count(nrhs == 13, "SPH:Physics:transport:nrhs",
                   "transport_correction expects 13 inputs after mode.");
@@ -475,6 +555,9 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
     inc_x = (double *)mxCalloc((mwSize)n_total, sizeof(double));
     inc_y = (double *)mxCalloc((mwSize)n_total, sizeof(double));
 
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (k = 0; k < n_pairs; ++k) {
         int ii = (int)pair_i[k] - 1;
         int jj = (int)pair_j[k] - 1;
@@ -509,9 +592,21 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
             double coeff_i = -dWk * Vol[jj];
             double coeff_j = dWk * Vol[ii];
 
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             inc_x[ii] += coeff_i * tx;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             inc_y[ii] += coeff_i * ty;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             inc_x[jj] += coeff_j * tx;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             inc_y[jj] += coeff_j * ty;
         } else {
             double tx = b11i * ex + b12i * ey;
@@ -579,7 +674,7 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
     double *force_x;
     double *force_y;
     double *diss;
-    mwSize k;
+    int k;  /* Changed from mwSize to int for OpenMP compatibility */
 
     require_count(nrhs == 22, "SPH:Physics:int1:nrhs",
                   "integration_1st expects 21 inputs after mode.");
@@ -667,6 +762,9 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
         pos_out_y[i] += 0.5 * dt * vel_y[i];
     }
 
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (k = 0; k < n_pairs; ++k) {
         int ii = (int)pair_i[k] - 1;
         int jj = (int)pair_j[k] - 1;
@@ -696,12 +794,30 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
             double dWVi = dWk * Vol[ii];
             double p_diff = p_i - p_j;
 
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             force_x[ii] -= tx * dWVj;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             force_y[ii] -= ty * dWVj;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             force_x[jj] += tx * dWVi;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             force_y[jj] += ty * dWVi;
 
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             diss[ii] += (p_diff / (rho0 * c_f)) * dWVj;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             diss[jj] += (-p_diff / (rho0 * c_f)) * dWVi;
         } else {
             double p_i = p_out[ii];
@@ -715,8 +831,17 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
             double tx = b11i * ex + b12i * ey;
             double ty = b21i * ex + b22i * ey;
 
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             force_x[ii] -= (p_i + p_wall) * dWVj * tx;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             force_y[ii] -= (p_i + p_wall) * dWVj * ty;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             diss[ii] += ((p_i - p_wall) / (rho0 * c_f)) * dWVj;
         }
     }
@@ -766,7 +891,7 @@ static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxAr
     double *drho_out;
     double *force_out;
     double *drho_rate;
-    mwSize k;
+    int k;  /* Changed from mwSize to int for OpenMP compatibility */
 
     require_count(nrhs == 15, "SPH:Physics:int2:nrhs",
                   "integration_2nd expects 15 inputs after mode.");
@@ -823,6 +948,9 @@ static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxAr
 
     drho_rate = (double *)mxCalloc((mwSize)n_total, sizeof(double));
 
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (k = 0; k < n_pairs; ++k) {
         int ii = (int)pair_i[k] - 1;
         int jj = (int)pair_j[k] - 1;
@@ -839,7 +967,13 @@ static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxAr
 
         if (jj < n_fluid) {
             double u_jump = (vel_x[ii] - vel_x[jj]) * ex + (vel_y[ii] - vel_y[jj]) * ey;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             drho_rate[ii] += u_jump * dWk * Vol[jj];
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             drho_rate[jj] += u_jump * dWk * Vol[ii];
         } else {
             double nwx = 0.0;
@@ -848,6 +982,9 @@ static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxAr
             double face_nx = (sign_en >= 0.0) ? nwx : -nwx;
             double face_ny = (sign_en >= 0.0) ? nwy : -nwy;
             double u_jump = 2.0 * ((vel_x[ii] - wall_vel_x[jj]) * face_nx + (vel_y[ii] - wall_vel_y[jj]) * face_ny);
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
             drho_rate[ii] += u_jump * dWk * Vol[jj];
         }
     }

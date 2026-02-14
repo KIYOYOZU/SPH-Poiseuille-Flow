@@ -188,12 +188,9 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         int cyi = (int)floor((yi - y_min) / cell_size);
         int cid;
 
-        if (i < n_fluid) {
-            double xi_wrapped = xi - floor(xi / DL) * DL;
-            cxi = (int)floor(xi_wrapped / cell_size);
-        } else {
-            cxi = (int)floor(xi / cell_size);
-        }
+        /* 所有粒子（含壁面）统一做周期包裹后分配 cell */
+        double xi_wrapped = xi - floor(xi / DL) * DL;
+        cxi = (int)floor(xi_wrapped / cell_size);
 
         if (cxi < 0) cxi = 0;
         if (cxi >= n_cell_x) cxi = n_cell_x - 1;
@@ -251,12 +248,11 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
                         }
                         if (!skip_pair) {
                             dx_ij = x[i] - x[j];
-                            if (j < n_fluid) {
-                                if (dx_ij > 0.5 * DL) {
-                                    dx_ij -= DL;
-                                } else if (dx_ij < -0.5 * DL) {
-                                    dx_ij += DL;
-                                }
+                            /* 所有 pair（含 fluid-wall）均做周期最小像距 */
+                            if (dx_ij > 0.5 * DL) {
+                                dx_ij -= DL;
+                            } else if (dx_ij < -0.5 * DL) {
+                                dx_ij += DL;
                             }
                             dy_ij = y[i] - y[j];
                             r2 = dx_ij * dx_ij + dy_ij * dy_ij;

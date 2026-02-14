@@ -22,8 +22,8 @@ end
 addpath(build_dir);
 
 %% S1: MEX 自动编译
-neighbor_mex_name = 'sph_neighbor_search_mex_v2';
-physics_mex_name = 'sph_physics_mex_v2';
+neighbor_mex_name = 'sph_neighbor_search_mex';
+physics_mex_name = 'sph_physics_mex';
 ensure_mex_compiled(fullfile(mex_dir, 'sph_neighbor_search_mex.c'), neighbor_mex_name, build_dir);
 ensure_mex_compiled(fullfile(mex_dir, 'sph_physics_mex.c'), physics_mex_name, build_dir);
 
@@ -41,6 +41,7 @@ c_f = get_ini_numeric(cfg, 'physical', 'c_f');
 t_end = get_ini_numeric(cfg, 'simulation', 'end_time');
 output_interval = get_ini_numeric(cfg, 'simulation', 'output_interval');
 sort_interval = round(get_ini_numeric(cfg, 'simulation', 'sort_interval'));
+restart_from_file = round(get_ini_numeric(cfg, 'simulation', 'restart_from_file'));
 
 gravity_g = 12.0 * mu * U_f / (rho0 * DH^2);
 U_max = 1.5 * U_f;
@@ -110,7 +111,7 @@ config_signature = create_config_signature(DL, DH, dp, rho0, mu, U_f, c_f, t_end
 t = 0.0;
 step = 0;
 
-if exist(restart_path, 'file')
+if restart_from_file && exist(restart_path, 'file')
     restart_data = load(restart_path, 'state', 'config_signature');
     can_resume = isfield(restart_data, 'state') && isfield(restart_data, 'config_signature') ...
         && strcmp(restart_data.config_signature, config_signature);
@@ -177,6 +178,8 @@ while t < t_end - 1e-12
             pair_i, pair_j, dx_ij, dy_ij, r_ij, dW_ij, ...
             Vol, B, pos, h, n_fluid, n_total);
 
+        pos = bounding_from_wall(pos, n_fluid, DH, dp);
+
         relaxation_time = 0.0;
         while relaxation_time < Dt - 1e-12
             dt = acoustic_time_step(vel(1:n_fluid, :), c_f, h, Dt - relaxation_time);
@@ -199,10 +202,14 @@ while t < t_end - 1e-12
                 [pair_i, pair_j, dx_ij, dy_ij, r_ij, W_ij, dW_ij] = feval(neighbor_mex_name, pos, n_fluid, n_total, h, DL);
             end
 
+            % BoundingFromWall: SPHinXsys 风格壁面防穿透
+            pos = bounding_from_wall(pos, n_fluid, DH, dp);
+
             relaxation_time = relaxation_time + dt;
         end
 
         [pos, ~] = periodic_bounding(pos, n_fluid, DL, periodic_buffer);
+        pos = bounding_from_wall(pos, n_fluid, DH, dp);
         vel(n_fluid+1:end, :) = wall_vel(n_fluid+1:end, :);
 
         if mod(step, sort_interval) == 0 && step ~= 1
@@ -280,6 +287,7 @@ xlabel('x');
 ylabel('y');
 title('Particle Distribution & u_x');
 colormap(turbo);
+caxis([0, 1.2]);  % 设置颜色范围为 0 到 1.2
 cb = colorbar;
 cb.Label.String = 'u_x';
 
@@ -490,4 +498,25 @@ end
 
 function save_restart(restart_path, config_signature, state)
     save(restart_path, 'state', 'config_signature', '-v7.3');
+end
+
+function pos = bounding_from_wall(pos, n_fluid, DH, dp)
+% BoundingFromWall (SPHinXsys 风格)
+% 粒子到壁面距离 < 0.25*dp 时，弹回到 0.5*dp 处
+    dist_min = 0.25 * dp;
+    half_dp = 0.5 * dp;
+    y = pos(1:n_fluid, 2);
+
+    % 下壁面 (y=0, 法向 +y)
+    too_close_bottom = (y < dist_min);
+    if any(too_close_bottom)
+        pos(too_close_bottom, 2) = half_dp;
+    end
+
+    % 上壁面 (y=DH, 法向 -y)
+    dist_top = DH - y;
+    too_close_top = (dist_top < dist_min);
+    if any(too_close_top)
+        pos(too_close_top, 2) = DH - half_dp;
+    end
 end
