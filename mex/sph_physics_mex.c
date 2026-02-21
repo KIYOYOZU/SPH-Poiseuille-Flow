@@ -1,14 +1,13 @@
 /*
  * sph_physics_mex.c
- * SPH 物理算子 MEX 实现，支持 OpenMP 并行加速。
- * 通过模式字符串分发到不同物理计算：
+ * SPH physics operators with mode dispatch.
  *
  * Modes:
- *   - density_correction   : 密度重初始化 + 核梯度修正矩阵 B
- *   - viscous_force        : 层流粘性力（含壁面无滑移镜像速度）
- *   - transport_correction : 传输速度修正（抑制张力不稳定性）
- *   - integration_1st      : 第一阶段积分（密度演化 + 压力 + 位置半步 + 压力梯度力）
- *   - integration_2nd      : 第二阶段积分（位置修正 + 密度散度修正）
+ *   - density_correction
+ *   - viscous_force
+ *   - transport_correction
+ *   - integration_1st
+ *   - integration_2nd
  *
  * Build with OpenMP:
  *   Windows (MSVC): mex -R2018a -O COMPFLAGS="$COMPFLAGS /openmp" sph_physics_mex.c
@@ -25,7 +24,6 @@
 
 #define EPS_REG 1e-8
 
-/* 2D 三次样条核函数在 r=0 处的值 W(0,h) */
 static double cubic_kernel_w0(double h)
 {
     const double pi = 3.14159265358979323846;
@@ -67,39 +65,33 @@ static void get_pair_data(const mxArray *arr_i, const mxArray *arr_j,
     *n_pairs = ni;
 }
 
-/* 密度重初始化 + 核梯度修正矩阵 B
- * 输出: rho(密度), Vol(粒子体积), B(2x2修正矩阵，展平为4列) */
 static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
-    /* ---- 粒子对数据（由邻居搜索预计算） ---- */
-    const double *pair_i;       /* 粒子对 i 索引 (1-based) */
-    const double *pair_j;       /* 粒子对 j 索引 (1-based) */
-    const double *dx;           /* 位移 x 分量: x_i - x_j */
-    const double *dy;           /* 位移 y 分量: y_i - y_j */
-    const double *r;            /* 粒子对距离 |r_ij| */
-    const double *W;            /* 核函数值 W(r_ij, h) */
-    const double *dW;           /* 核函数径向导数 dW/dr */
-    const double *mass;         /* 粒子质量 [n_total] */
-    mwSize n_pairs;             /* 粒子对总数 */
-    /* ---- 物理/网格参数 ---- */
-    int n_fluid;                /* 流体粒子数 */
-    int n_total;                /* 总粒子数 = 流体 + 壁面 */
-    double rho0;                /* 参考密度 ρ₀ */
-    double h;                   /* 光滑长度 */
-    double inv_sigma0;          /* 核函数归一化倒数 1/σ₀，用于密度修正 */
-    double W0;                  /* 核函数自身贡献 W(0,h) */
-    /* ---- 输出数组 ---- */
-    double *rho_out;            /* 修正后密度 [n_total] */
-    double *Vol_out;            /* 粒子体积 V=m/ρ [n_total] */
-    double *B_out;              /* 核梯度修正矩阵 B，展平为 [n_total x 4] */
-    /* ---- 中间累加数组 ---- */
-    double *sigma_inner;        /* 流体-流体核函数求和 Σ W_ij */
-    double *sigma_contact;      /* 流体-壁面接触项核函数求和 */
-    double *A11;                /* 梯度修正矩阵 A 的 (1,1) 分量 */
-    double *A12;                /* A 的 (1,2) 分量 */
-    double *A21;                /* A 的 (2,1) 分量 */
-    double *A22;                /* A 的 (2,2) 分量 */
-    int k;                      /* 粒子对循环索引 (int 兼容 OpenMP) */
+    const double *pair_i;
+    const double *pair_j;
+    const double *dx;
+    const double *dy;
+    const double *r;
+    const double *W;
+    const double *dW;
+    const double *mass;
+    mwSize n_pairs;
+    int n_fluid;
+    int n_total;
+    double rho0;
+    double h;
+    double inv_sigma0;
+    double W0;
+    double *rho_out;
+    double *Vol_out;
+    double *B_out;
+    double *sigma_inner;
+    double *sigma_contact;
+    double *A11;
+    double *A12;
+    double *A21;
+    double *A22;
+    int k;  /* Changed from mwSize to int for OpenMP compatibility */
     int i;
 
     require_count(nrhs == 14, "SPH:Physics:density:nrhs",
@@ -152,15 +144,11 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
     A21 = (double *)mxCalloc((mwSize)n_fluid, sizeof(double));
     A22 = (double *)mxCalloc((mwSize)n_fluid, sizeof(double));
 
-    /* 初始化：每个流体粒子的核函数求和包含自身贡献 W(0,h) */
     W0 = cubic_kernel_w0(h);
     for (i = 0; i < n_fluid; ++i) {
         sigma_inner[i] = W0;
     }
 
-    /* 第一遍遍历：累加核函数值
-     * 流体-流体对: σ_i += W_ij, σ_j += W_ij（对称）
-     * 流体-壁面对: σ_contact_i += W_ij × (m_j/ρ₀) */
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
@@ -194,10 +182,8 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
         rho_out[i] = rho0;
     }
 
-    /* 密度重初始化公式:
-     * ρ_i = (Σ_j W_ij) × ρ₀ / σ₀  +  Σ_wall W_iw × (m_w/ρ₀) × ρ₀²/(σ₀ × m_i)
-     * 其中 σ₀ = Σ W(r_uniform) 为均匀分布下的核函数求和 */
     for (i = 0; i < n_fluid; ++i) {
+        double rhoi = sigma_inner[i] * rho0 * inv_sigma0;
         rhoi += sigma_contact[i] * rho0 * rho0 * inv_sigma0 / mass[i];
         if (rhoi <= 1e-12) {
             rhoi = rho0;
@@ -205,21 +191,24 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
         rho_out[i] = rhoi;
     }
 
-    /* 计算粒子体积 V_i = m_i / ρ_i */
     for (i = 0; i < n_total; ++i) {
+        double rhoi = rho_out[i];
+        if (rhoi <= 1e-12) {
             rhoi = rho0;
             rho_out[i] = rhoi;
         }
         Vol_out[i] = mass[i] / rhoi;
     }
 
-    /* 第二遍遍历：构建核梯度修正矩阵 A
-     * A_i = Σ_j V_j × (dW/dr) × (e ⊗ r_ij)
-     * 其中 e = r_ij/|r_ij| 为单位方向向量
-     * 最终 B = A⁻¹ 用于修正核梯度 */
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
+    for (k = 0; k < n_pairs; ++k) {
+        int ii = (int)pair_i[k] - 1;
+        int jj = (int)pair_j[k] - 1;
+        double rk = r[k];
+        double dWk = dW[k];
+        double ex, ey;
 
         if (ii < 0 || ii >= n_fluid || jj < 0 || jj >= n_total || rk <= 1e-12) {
             continue;
@@ -289,7 +278,6 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
         }
     }
 
-    /* 初始化 B 为单位矩阵（壁面粒子不做修正） */
     for (i = 0; i < n_total; ++i) {
         B_out[i] = 1.0;
         B_out[i + n_total] = 0.0;
@@ -297,11 +285,6 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
         B_out[i + 3 * n_total] = 1.0;
     }
 
-    /* 计算核梯度修正矩阵 B = A⁻¹（伪逆 + 混合权重）
-     * 1. 构建 AᵀA 并求逆 → (AᵀA)⁻¹
-     * 2. 伪逆 P = (AᵀA)⁻¹ × Aᵀ
-     * 3. 混合权重: w₁ = det(A)/(det(A)+max(1-det(A),0))
-     *    当 det(A)≈1 时 B≈P（修正生效），det(A)≈0 时 B≈I（退化为标准SPH） */
     for (i = 0; i < n_fluid; ++i) {
         double a11 = A11[i], a12 = A12[i], a21 = A21[i], a22 = A22[i];
         double ata11 = a11 * a11 + a21 * a21 + EPS_REG;
@@ -357,41 +340,34 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
     mxFree(A22);
 }
 
-/* 粘性力计算：基于修正核梯度的层流粘性模型
- * 壁面粒子使用镜像速度实现无滑移边界条件 */
 static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
-    /* ---- 粒子对数据 ---- */
-    const double *pair_i;       /* 粒子对 i 索引 */
-    const double *pair_j;       /* 粒子对 j 索引 */
-    const double *dx;           /* 位移 x 分量 */
-    const double *dy;           /* 位移 y 分量 */
-    const double *r;            /* 粒子对距离 */
-    const double *dW;           /* 核函数径向导数 */
-    mwSize n_pairs;             /* 粒子对总数 */
-    /* ---- 物理量输入 ---- */
-    const double *vel;          /* 速度场 [n_total x 2] */
-    const double *Vol;          /* 粒子体积 [n_total] */
-    const double *B;            /* 核梯度修正矩阵 [n_total x 4] */
-    const double *mass;         /* 粒子质量 [n_total] */
-    const double *wall_vel;     /* 壁面粒子速度（无滑移镜像） [n_total x 2] */
-    int n_fluid;                /* 流体粒子数 */
-    int n_total;                /* 总粒子数 */
-    double mu;                  /* 动力粘度 μ */
-    double h;                   /* 光滑长度 */
-    /* ---- 速度分量指针（列优先布局） ---- */
-    const double *vel_x;        /* 流体 x 速度 */
-    const double *vel_y;        /* 流体 y 速度 */
-    const double *wall_vel_x;   /* 壁面 x 速度 */
-    const double *wall_vel_y;   /* 壁面 y 速度 */
-    /* ---- 输出 ---- */
-    double *force_out;          /* 粘性力输出 [n_total x 2] */
-    double *force_x;            /* 粘性力 x 分量 */
-    double *force_y;            /* 粘性力 y 分量 */
-    /* ---- 中间累加 ---- */
-    double *acc_x;              /* 粘性加速度 x 累加 */
-    double *acc_y;              /* 粘性加速度 y 累加 */
-    int k;                      /* 循环索引 (int 兼容 OpenMP) */
+    const double *pair_i;
+    const double *pair_j;
+    const double *dx;
+    const double *dy;
+    const double *r;
+    const double *dW;
+    mwSize n_pairs;
+    const double *vel;
+    const double *Vol;
+    const double *B;
+    const double *mass;
+    const double *wall_vel;
+    int n_fluid;
+    int n_total;
+    double mu;
+    double h;
+    const double *vel_x;
+    const double *vel_y;
+    const double *wall_vel_x;
+    const double *wall_vel_y;
+    double *force_out;
+    double *force_x;
+    double *force_y;
+    double *acc_x;
+    double *acc_y;
+    int k;  /* Changed from mwSize to int for OpenMP compatibility */
 
     require_count(nrhs == 16, "SPH:Physics:viscous:nrhs",
                   "viscous_force expects 16 inputs after mode.");
@@ -434,9 +410,6 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
     acc_x = (double *)mxCalloc((mwSize)n_total, sizeof(double));
     acc_y = (double *)mxCalloc((mwSize)n_total, sizeof(double));
 
-    /* 粘性力计算主循环：基于修正核梯度的层流粘性模型
-     * 公式: F_visc = μ × Σ_j (B_i + B_j) × (dW/dr) × V_j × (v_i - v_j) / (r + 0.01h)
-     * 其中 B 为核梯度修正矩阵，确保一阶精度 */
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
@@ -460,8 +433,6 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
         b21i = B[ii + 2 * n_total];
         b22i = B[ii + 3 * n_total];
 
-        /* 流体-流体对：对称粘性力 */
-        /* 流体-流体对：对称粘性力 */
         if (jj < n_fluid) {
             double b11j = B[jj];
             double b12j = B[jj + n_total];
@@ -471,9 +442,8 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
             double bs12 = b12i + b12j;
             double bs21 = b21i + b21j;
             double bs22 = b22i + b22j;
-            /* 修正核梯度投影: eᵀ(B_i+B_j)e，确保一阶精度 */
             double eBe = ex * (bs11 * ex + bs12 * ey) + ey * (bs21 * ex + bs22 * ey);
-            double denom = rk + 0.01 * h;  /* 分母正则化，避免奇异 */
+            double denom = rk + 0.01 * h;
             double dvx = vel_x[ii] - vel_x[jj];
             double dvy = vel_y[ii] - vel_y[jj];
             double coeff_i = eBe * mu * dWk * Vol[jj] / denom;
@@ -496,8 +466,6 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
             #endif
             acc_y[jj] -= coeff_j * dvy;
         } else {
-            /* 流体-壁面对：无滑移边界条件（镜像速度）
-             * 系数 × 4 来自壁面粒子的镜像对称性 */
             double eBe = ex * (b11i * ex + b12i * ey) + ey * (b21i * ex + b22i * ey);
             double denom = rk + 0.01 * h;
             double dvx = vel_x[ii] - wall_vel_x[jj];
@@ -515,7 +483,6 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
         }
     }
 
-    /* 转换加速度为力: F = a × V（体积力形式） */
     for (int i = 0; i < n_fluid; ++i) {
         force_x[i] = acc_x[i] * Vol[i];
         force_y[i] = acc_y[i] * Vol[i];
@@ -530,36 +497,29 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
     mxFree(acc_y);
 }
 
-/* 传输速度修正：抑制粒子聚集/空洞（张力不稳定性）
- * 通过额外的位置修正项保持粒子分布均匀 */
 static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
-    /* ---- 粒子对数据 ---- */
-    const double *pair_i;       /* 粒子对 i 索引 */
-    const double *pair_j;       /* 粒子对 j 索引 */
-    const double *dx;           /* 位移 x 分量 */
-    const double *dy;           /* 位移 y 分量 */
-    const double *r;            /* 粒子对距离 */
-    const double *dW;           /* 核函数径向导数 */
-    mwSize n_pairs;             /* 粒子对总数 */
-    /* ---- 物理量输入 ---- */
-    const double *Vol;          /* 粒子体积 [n_total] */
-    const double *B;            /* 核梯度修正矩阵 [n_total x 4] */
-    const double *pos;          /* 粒子位置 [n_total x 2] */
-    int n_fluid;                /* 流体粒子数 */
-    int n_total;                /* 总粒子数 */
-    double h;                   /* 光滑长度 */
-    /* ---- 位置分量指针 ---- */
-    const double *pos_x;        /* x 坐标 */
-    const double *pos_y;        /* y 坐标 */
-    /* ---- 输出 ---- */
-    double *pos_out;            /* 修正后位置 [n_total x 2] */
-    double *pos_out_x;          /* 修正后 x 坐标 */
-    double *pos_out_y;          /* 修正后 y 坐标 */
-    /* ---- 中间累加 ---- */
-    double *inc_x;              /* 传输修正增量 x */
-    double *inc_y;              /* 传输修正增量 y */
-    int k;                      /* 循环索引 (int 兼容 OpenMP) */
+    const double *pair_i;
+    const double *pair_j;
+    const double *dx;
+    const double *dy;
+    const double *r;
+    const double *dW;
+    mwSize n_pairs;
+    const double *Vol;
+    const double *B;
+    const double *pos;
+    int n_fluid;
+    int n_total;
+    double h;
+    const double *pos_x;
+    const double *pos_y;
+    double *pos_out;
+    double *pos_out_x;
+    double *pos_out_y;
+    double *inc_x;
+    double *inc_y;
+    int k;  /* Changed from mwSize to int for OpenMP compatibility */
 
     require_count(nrhs == 13, "SPH:Physics:transport:nrhs",
                   "transport_correction expects 13 inputs after mode.");
@@ -595,9 +555,6 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
     inc_x = (double *)mxCalloc((mwSize)n_total, sizeof(double));
     inc_y = (double *)mxCalloc((mwSize)n_total, sizeof(double));
 
-    /* 传输速度修正主循环：
-     * Δr_i = -Σ_j V_j × (B_i + B_j) × (dW/dr) × e_ij
-     * 作用：将粒子推向低密度区域，抑制张力不稳定性 */
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
@@ -621,7 +578,6 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
         b21i = B[ii + 2 * n_total];
         b22i = B[ii + 3 * n_total];
 
-        /* 流体-流体对：对称修正 */
         if (jj < n_fluid) {
             double b11j = B[jj];
             double b12j = B[jj + n_total];
@@ -631,7 +587,6 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
             double bs12 = b12i + b12j;
             double bs21 = b21i + b21j;
             double bs22 = b22i + b22j;
-            /* 修正核梯度方向: t = (B_i + B_j) × e */
             double tx = bs11 * ex + bs12 * ey;
             double ty = bs21 * ex + bs22 * ey;
             double coeff_i = -dWk * Vol[jj];
@@ -654,7 +609,6 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
             #endif
             inc_y[jj] += coeff_j * ty;
         } else {
-            /* 流体-壁面对：系数 × 2（镜像对称） */
             double tx = b11i * ex + b12i * ey;
             double ty = b21i * ex + b22i * ey;
             double coeff = -2.0 * dWk * Vol[jj];
@@ -663,7 +617,6 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
         }
     }
 
-    /* 应用修正增量: r_new = r_old + ε × Δr，ε = 0.5h 为修正强度 */
     for (int i = 0; i < n_fluid; ++i) {
         double n2 = inc_x[i] * inc_x[i] + inc_y[i] * inc_y[i];
         double limiter = 100.0 * n2 / (h * h);
@@ -678,41 +631,36 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
     mxFree(inc_y);
 }
 
-/* 第一阶段积分（Verlet 分裂格式前半步）：
- * 密度连续性方程演化 → 弱可压缩状态方程求压力 → 位置半步推进 → 压力梯度力 */
 static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
-    /* ---- 粒子对数据 ---- */
-    const double *pair_i;       /* 粒子对 i 索引 */
-    const double *pair_j;       /* 粒子对 j 索引 */
-    const double *dx;           /* 位移 x 分量 */
-    const double *dy;           /* 位移 y 分量 */
-    const double *r;            /* 粒子对距离 */
-    const double *dW;           /* 核函数径向导数 */
-    mwSize n_pairs;             /* 粒子对总数 */
-    /* ---- 物理量输入 ---- */
-    const double *Vol;          /* 粒子体积 [n_total] */
-    const double *B;            /* 核梯度修正矩阵 [n_total x 4] */
-    const double *rho_in;       /* 输入密度 [n_total] */
-    const double *mass;         /* 粒子质量 [n_total] */
-    const double *pos_in;       /* 输入位置 [n_total x 2] */
-    const double *vel;          /* 速度场 [n_total x 2] */
-    const double *drho_in;      /* 上一步密度变化率 dρ/dt [n_total] */
-    const double *force_prior;  /* 上一步合力（粘性+体积力）[n_total x 2] */
-    double dt;                  /* 时间步长 Δt */
-    int n_fluid;                /* 流体粒子数 */
-    int n_total;                /* 总粒子数 */
-    double rho0;                /* 参考密度 ρ₀ */
-    double p0;                  /* 状态方程压力系数 p₀ = ρ₀c² */
-    double c_f;                 /* 人工声速 c */
-    const double *wall_vel;     /* 壁面粒子速度 [n_total x 2] */
-    /* ---- 输出数组 ---- */
-    double *rho_out;            /* 半步密度 ρ^(n+1/2) [n_total] */
-    double *p_out;              /* 压力 p = p₀(ρ/ρ₀ - 1) [n_total] */
-    double *pos_out;            /* 半步位置 [n_total x 2] */
-    double *force_out;          /* 压力梯度力 [n_total x 2] */
-    double *drho_out;           /* 密度散度修正项 [n_total] */
-    /* ---- 速度/位置分量指针（列优先） ---- */
+    const double *pair_i;
+    const double *pair_j;
+    const double *dx;
+    const double *dy;
+    const double *r;
+    const double *dW;
+    mwSize n_pairs;
+    const double *Vol;
+    const double *B;
+    const double *rho_in;
+    const double *mass;
+    const double *pos_in;
+    const double *vel;
+    const double *drho_in;
+    const double *force_prior;
+    double dt;
+    int n_fluid;
+    int n_total;
+    double rho0;
+    double p0;
+    double c_f;
+    const double *wall_vel;
+
+    double *rho_out;
+    double *p_out;
+    double *pos_out;
+    double *force_out;
+    double *drho_out;
     const double *vel_x;
     const double *vel_y;
     const double *pos_x;
@@ -723,10 +671,10 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
     const double *wall_vel_y;
     double *pos_out_x;
     double *pos_out_y;
-    double *force_x;            /* 压力梯度力 x 分量 */
-    double *force_y;            /* 压力梯度力 y 分量 */
-    double *diss;               /* 密度耗散累加项（Molteni-Colagrossi δ-SPH） */
-    int k;                      /* 循环索引 (int 兼容 OpenMP) */
+    double *force_x;
+    double *force_y;
+    double *diss;
+    int k;  /* Changed from mwSize to int for OpenMP compatibility */
 
     require_count(nrhs == 22, "SPH:Physics:int1:nrhs",
                   "integration_1st expects 21 inputs after mode.");
@@ -804,10 +752,6 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
 
     diss = (double *)mxCalloc((mwSize)n_total, sizeof(double));
 
-    /* 第一步：密度半步推进 + 状态方程求压力 + 位置半步推进
-     * ρ^(n+1/2) = ρ^n + 0.5 × Δt × (dρ/dt)^n
-     * p^(n+1/2) = p₀ × (ρ^(n+1/2)/ρ₀ - 1)  [弱可压缩状态方程]
-     * r^(n+1/2) = r^n + 0.5 × Δt × v^n */
     for (int i = 0; i < n_fluid; ++i) {
         rho_out[i] = rho_out[i] + 0.5 * dt * drho_in[i];
         if (rho_out[i] < 1e-10) {
@@ -818,9 +762,6 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
         pos_out_y[i] += 0.5 * dt * vel_y[i];
     }
 
-    /* 第二步：计算压力梯度力（对称形式）+ 密度耗散项（δ-SPH）
-     * F_pressure = -Σ_j (p_i × B_j + p_j × B_i) × (dW/dr) × V_j × e_ij
-     * δ-SPH 耗散: dρ/dt += 2δhc × Σ_j (p_i - p_j)/(ρ₀c) × (dW/dr) × V_j */
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
@@ -838,13 +779,11 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
         ex = dx[k] / rk;
         ey = dy[k] / rk;
 
-        /* 流体-流体对：对称压力梯度 + 密度耗散 */
         if (jj < n_fluid) {
             double p_i = p_out[ii];
             double p_j = p_out[jj];
             double b11i = B[ii], b12i = B[ii + n_total], b21i = B[ii + 2 * n_total], b22i = B[ii + 3 * n_total];
             double b11j = B[jj], b12j = B[jj + n_total], b21j = B[jj + 2 * n_total], b22j = B[jj + 3 * n_total];
-            /* 压力梯度修正矩阵: M = p_i × B_j + p_j × B_i */
             double m11 = p_i * b11j + p_j * b11i;
             double m12 = p_i * b12j + p_j * b12i;
             double m21 = p_i * b21j + p_j * b21i;
@@ -881,9 +820,6 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
             #endif
             diss[jj] += (-p_diff / (rho0 * c_f)) * dWVi;
         } else {
-            /* 流体-壁面对：壁面压力外推（考虑体积力）
-             * p_wall = p_i + ρ_i × r × max(0, -a·e)
-             * 其中 a 为上一步加速度，确保壁面压力非负 */
             double p_i = p_out[ii];
             double rho_i = rho_out[ii];
             double b11i = B[ii], b12i = B[ii + n_total], b21i = B[ii + 2 * n_total], b22i = B[ii + 3 * n_total];
@@ -910,8 +846,6 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
         }
     }
 
-    /* 第三步：转换为体积力形式 + 应用密度耗散
-     * F = a × V，dρ/dt = ρ × (散度项) */
     for (int i = 0; i < n_fluid; ++i) {
         force_x[i] *= Vol[i];
         force_y[i] *= Vol[i];
@@ -928,43 +862,36 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
     mxFree(diss);
 }
 
-/* 第二阶段积分（Verlet 分裂格式后半步）：
- * 位置修正（完成全步推进）+ 密度散度修正（抑制密度振荡） */
 static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
-    /* ---- 粒子对数据 ---- */
-    const double *pair_i;       /* 粒子对 i 索引 */
-    const double *pair_j;       /* 粒子对 j 索引 */
-    const double *dx;           /* 位移 x 分量 */
-    const double *dy;           /* 位移 y 分量 */
-    const double *r;            /* 粒子对距离 */
-    const double *dW;           /* 核函数径向导数 */
-    mwSize n_pairs;             /* 粒子对总数 */
-    /* ---- 物理量输入 ---- */
-    const double *Vol;          /* 粒子体积 [n_total] */
-    const double *rho;          /* 当前密度 [n_total] */
-    const double *pos_in;       /* 输入位置 [n_total x 2] */
-    const double *vel;          /* 速度场 [n_total x 2] */
-    double dt;                  /* 时间步长 Δt */
-    int n_fluid;                /* 流体粒子数 */
-    int n_total;                /* 总粒子数 */
-    const double *wall_vel;     /* 壁面粒子速度 [n_total x 2] */
-    /* ---- 速度/位置分量指针 ---- */
+    const double *pair_i;
+    const double *pair_j;
+    const double *dx;
+    const double *dy;
+    const double *r;
+    const double *dW;
+    mwSize n_pairs;
+    const double *Vol;
+    const double *rho;
+    const double *pos_in;
+    const double *vel;
+    double dt;
+    int n_fluid;
+    int n_total;
+    const double *wall_vel;
     const double *vel_x;
     const double *vel_y;
     const double *pos_x;
     const double *pos_y;
     const double *wall_vel_x;
     const double *wall_vel_y;
-    /* ---- 输出数组 ---- */
-    double *pos_out;            /* 全步位置 [n_total x 2] */
+    double *pos_out;
     double *pos_out_x;
     double *pos_out_y;
-    double *drho_out;           /* 密度连续性方程变化率 dρ/dt [n_total] */
-    double *force_out;          /* 占位力输出（本阶段为零）[n_total x 2] */
-    /* ---- 中间累加 ---- */
-    double *drho_rate;          /* 速度散度累加 ∇·v [n_total] */
-    int k;                      /* 循环索引 (int 兼容 OpenMP) */
+    double *drho_out;
+    double *force_out;
+    double *drho_rate;
+    int k;  /* Changed from mwSize to int for OpenMP compatibility */
 
     require_count(nrhs == 15, "SPH:Physics:int2:nrhs",
                   "integration_2nd expects 15 inputs after mode.");
@@ -1014,8 +941,6 @@ static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxAr
     memset(drho_out, 0, (mwSize)n_total * sizeof(double));
     memset(force_out, 0, (mwSize)n_total * 2 * sizeof(double));
 
-    /* 第一步：位置全步推进（完成 Verlet 后半步）
-     * r^(n+1) = r^(n+1/2) + 0.5 × Δt × v^(n+1) */
     for (int i = 0; i < n_fluid; ++i) {
         pos_out_x[i] += 0.5 * dt * vel_x[i];
         pos_out_y[i] += 0.5 * dt * vel_y[i];
@@ -1023,8 +948,6 @@ static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxAr
 
     drho_rate = (double *)mxCalloc((mwSize)n_total, sizeof(double));
 
-    /* 第二步：计算密度散度修正（抑制密度振荡）
-     * dρ/dt = ρ × Σ_j V_j × (v_i - v_j)·e_ij × (dW/dr) */
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
@@ -1042,7 +965,6 @@ static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxAr
         ex = dx[k] / rk;
         ey = dy[k] / rk;
 
-        /* 流体-流体对：对称速度散度 */
         if (jj < n_fluid) {
             double u_jump = (vel_x[ii] - vel_x[jj]) * ex + (vel_y[ii] - vel_y[jj]) * ey;
             #ifdef _OPENMP
@@ -1054,9 +976,6 @@ static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxAr
             #endif
             drho_rate[jj] += u_jump * dWk * Vol[ii];
         } else {
-            /* 流体-壁面对：法向速度散度（考虑壁面法向）
-             * 自动识别壁面法向（y<0 → 下壁面，y>0 → 上壁面）
-             * 系数 × 2 来自镜像对称 */
             double nwx = 0.0;
             double nwy = (pos_y[jj] < 0.0) ? 1.0 : -1.0;
             double sign_en = ex * nwx + ey * nwy;
@@ -1070,8 +989,6 @@ static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxAr
         }
     }
 
-    /* 第三步：应用密度散度修正
-     * dρ/dt = ρ × (速度散度) */
     for (int i = 0; i < n_fluid; ++i) {
         drho_out[i] = drho_rate[i] * rho[i];
     }
