@@ -2,6 +2,10 @@
 
 基于**光滑粒子流体动力学 (Smoothed Particle Hydrodynamics, SPH)** 方法的二维平板泊肃叶流 (Poiseuille Flow) 数值模拟程序。采用 **MATLAB + C/MEX + OpenMP** 实现高性能计算。
 
+## Tips
+
+- **2026-02-21 备注：** 曾尝试将计算链路完全迁移到 GPU（含自定义 CUDA MEX），但实际性能与 CPU 占用未达预期，现已整体回滚到 GitHub 稳定版本。
+
 ## 物理问题
 
 模拟两平行板之间的重力驱动层流（泊肃叶流动），该问题具有解析解，适合用于验证 SPH 方法的准确性。
@@ -21,8 +25,8 @@ $$u(y) = \frac{g}{2\nu} y(H - y)$$
 | 粒子间距 dp | 0.04 m | 空间分辨率（约 1875 粒子） |
 | 参考密度 ρ₀ | 1.0 kg/m³ | 流体参考密度 |
 | 动力粘度 μ | 0.1 Pa·s | 流体粘度 |
-| 特征速度 U_f | 0.667 m/s | 用于计算雷诺数 |
-| 声速因子 c_f | 10.0 | 人工声速 c = c_f × U_f |
+| 截面平均速度 U_bulk | 0.667 m/s | U_max = 1.5*U_bulk, Re = ρ*U_max*DH/μ |
+| 声速因子 c_f | 10.0 | 人工声速 c = c_f × U_bulk |
 | 仿真时间 | 5.0 s | 物理时间（通常 3-4s 达到稳态） |
 
 ## 数值方法
@@ -50,7 +54,7 @@ $$u(y) = \frac{g}{2\nu} y(H - y)$$
 
 ## 模拟结果
 
-![模拟结果](SPH_Poiseuille_result.png)
+![模拟结果](SPH_Poiseuille_result.png?v=2)
 
 - **左图：** 速度剖面对比（黑线 = 解析解，红点 = SPH 结果）
 - **右图：** 粒子分布与速度场（彩色 = 流体粒子，灰色 = 壁面虚粒子）
@@ -113,8 +117,8 @@ mex -R2018a -O CFLAGS="$CFLAGS -fopenmp" LDFLAGS="$LDFLAGS -fopenmp" -output sph
 - `dp`：粒子间距（决定空间分辨率）
 - `rho0`：参考密度
 - `mu`：动力粘度
-- `U_f`：特征速度（用于计算雷诺数）
-- `c_f`：声速因子（人工声速 = c_f × U_f）
+- `U_bulk`：截面平均速度（U_max = 1.5*U_bulk）
+- `c_f`：声速因子（人工声速 = c_f × U_bulk）
 
 **仿真控制 [simulation]：**
 - `end_time`：仿真终止时间（秒）
