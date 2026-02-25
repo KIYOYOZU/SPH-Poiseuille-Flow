@@ -116,15 +116,11 @@ end
 
 ---
 
-## 3. 方案 B（D+B 实现版）：pair-wise tau 测量 + PI 输出 delta_tau 叠加 force_prior
+## 3. 方案 B：pair-wise tau 测量 + PI 输出 delta_tau 叠加 force_prior
 
 ### 3.1 物理原理
 
 壁面保持纯无滑移（`wall_vel = 0`），通过 PI 控制器测量数值切应力 τ_num，将误差转换为 delta_tau，再以等效体积力叠加到近壁流体粒子的 `force_prior`。
-
-核心区别：
-- 旧方案 D 路线A：PI → wall_vel → 粘性力（间接）
-- 本方案 D+B：PI → delta_tau → delta_F → force_prior（直接），wall_vel 恒零
 
 ### 3.2 推导
 
