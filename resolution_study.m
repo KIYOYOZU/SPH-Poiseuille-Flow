@@ -138,7 +138,7 @@ for k = 1:N_dp
         force_prior = viscous_force;
         force_prior(1:n_fluid,1) = force_prior(1:n_fluid,1) + mass(1:n_fluid)*gravity_g;
 
-        % === 方案 D+B：pair-wise tau 测量 + PI 输出 delta_tau 叠加 force_prior ===
+        % === 方案 B：pair-wise tau 测量 + PI 输出 delta_tau 叠加 force_prior ===
         % 下壁面切应力
         is_bottom = (pair_j > n_fluid) & (pos(pair_j,2) < 0);
         i_b = pair_i(is_bottom); j_b = pair_j(is_bottom);
@@ -184,7 +184,7 @@ for k = 1:N_dp
         delta_tau_t = k_p*e_t + k_i*I_top;
         near_top = pos(1:n_fluid,2) > DH - 2*h;
         force_prior(near_top,1) = force_prior(near_top,1) + delta_tau_t*dp^2;
-        % === 方案 D+B 结束 ===
+        % === 方案 B 结束 ===
 
         % 传输速度修正
         pos = feval(physics_mex_name, 'transport_correction', ...

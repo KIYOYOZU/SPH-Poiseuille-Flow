@@ -44,7 +44,7 @@ $$u(y) = \frac{g}{2\nu} y(H - y)$$
 - **传输修正：** Transport Velocity Correction（抑制数值扩散）
 - **边界条件：**
   - X 方向：周期性边界（缓冲层宽度 4dp），fluid-wall 对同样做周期最小像距
-  - Y 方向：4 层壁面虚粒子（镜像速度无滑移）+ 壁面防穿透
+  - Y 方向：4 层壁面虚粒子（无滑移）+ PI 反馈控制（pair-wise tau 测量 → delta_tau 叠加 force_prior）+ 壁面防穿透
 
 ### 架构特点
 - **配置驱动：** 所有参数通过 `config.ini` 配置

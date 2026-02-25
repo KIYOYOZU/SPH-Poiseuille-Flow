@@ -174,7 +174,7 @@ end
 p(1:n_fluid) = p0 * (rho(1:n_fluid) ./ rho0 - 1.0);
 p(n_fluid+1:end) = 0.0;
 
-% 方案 D+B：pair-wise 测量 tau_num + PI 输出 delta_tau 叠加到 force_prior
+% 方案 B：pair-wise 测量 tau_num + PI 输出 delta_tau 叠加到 force_prior
 tau_target = gravity_g * rho0 * DH / 2;  % 泊肃叶流壁面切应力解析值 [Pa]
 I_bottom = 0.0;         % 积分项（下壁面）
 I_top    = 0.0;         % 积分项（上壁面）
@@ -214,7 +214,7 @@ while t < t_end - 1e-12
         force_prior = viscous_force;
         force_prior(1:n_fluid, 1) = force_prior(1:n_fluid, 1) + mass(1:n_fluid) * gravity_g;  % 叠加体积力
 
-        % === 方案 D+B：pair-wise tau 测量 + PI 输出 delta_tau 叠加 force_prior ===
+        % === 方案 B：pair-wise tau 测量 + PI 输出 delta_tau 叠加 force_prior ===
         % 下壁面：识别流固粒子对（j 是壁面粒子且 y_j < 0）
         is_bottom = (pair_j > n_fluid) & (pos(pair_j, 2) < 0);
         i_b = pair_i(is_bottom);
@@ -264,7 +264,7 @@ while t < t_end - 1e-12
         delta_tau_t = k_p * e_t + k_i * I_top;
         near_top = pos(1:n_fluid, 2) > DH - 2*h;
         force_prior(near_top, 1) = force_prior(near_top, 1) + delta_tau_t * dp^2;
-        % === 方案 D+B 结束 ===
+        % === 方案 B 结束 ===
 
         % 传输速度修正（抑制张力不稳定性）
         pos = feval(physics_mex_name, 'transport_correction', ...
