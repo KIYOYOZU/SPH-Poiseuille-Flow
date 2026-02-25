@@ -58,65 +58,7 @@ F_visc,x^i = V_i · Σ_j coeff · (v_x^i - wall_vel_x^j)
 
 ---
 
-## 2. 方案 A：镜像速度 Neumann 法
-
-### 2.1 物理原理
-
-保持虚粒子框架不变，但不再令 `wall_vel=0`，而是根据 τ_w 动态计算虚粒子速度，使壁面处速度梯度等于 τ_w/μ。
-
-### 2.2 推导
-
-设壁面在 y=0，流体粒子 i 位于 y=y_i，对应虚粒子 j 位于 y=-y_j（关于壁面对称，y_j > 0）。
-
-壁面处速度梯度的 SPH 近似（线性插值）：
-
-$$\left.\frac{\partial u}{\partial y}\right|_{y=0} \approx \frac{u_i - u_{ghost}^j}{y_i + y_j}$$
-
-令其等于 τ_w/μ：
-
-$$\frac{u_i - u_{ghost}^j}{y_i + y_j} = \frac{\tau_w}{\mu}$$
-
-解出虚粒子速度：
-
-$$\boxed{u_{ghost}^j = u_i - \frac{\tau_w}{\mu}(y_i + y_j)}$$
-
-对于多个流体粒子影响同一虚粒子的情况，用核函数加权平均：
-
-设 $\tilde{u}^j = \frac{\sum_{i} u_i W_{ij}}{\sum_{i} W_{ij}}$ 为插值到虚粒子位置的流体速度，$\tilde{y}^j = \frac{\sum_{i} y_i W_{ij}}{\sum_{i} W_{ij}}$ 为对应的加权平均 y 坐标，则：
-
-$$\boxed{u_{ghost}^j = \tilde{u}^j - \frac{\tau_w}{\mu}(\tilde{y}^j + y_j)}$$
-
-其中 $y_j = |pos_j^y|$ 是虚粒子到壁面的距离（第 layer 层：$y_j = (2\cdot\text{layer}-1)\cdot dp/2$）。
-
-**验证**：τ_w=0 时 $u_{ghost}^j = \tilde{u}^j$，即虚粒子速度等于流体侧插值速度，壁面处梯度为零（正确的零梯度 Neumann 极限）。
-
-### 2.3 代码修改位置
-
-**MATLAB 层**（`SPH_Poiseuille.m`）：在每个对流步开始前，更新 `wall_vel`：
-
-```matlab
-% 下壁面虚粒子（索引 n_fluid+1 : n_fluid+n_bottom）
-for j = n_fluid+1 : n_fluid+n_bottom
-    y_j = abs(pos(j, 2));  % 虚粒子到壁面距离
-    % 核函数加权插值附近流体速度
-    % 简化版：直接用最近流体粒子速度
-    u_ghost_x = u_interp_j - (tau_w / mu) * y_j;
-    wall_vel(j, 1) = u_ghost_x;
-end
-% 上壁面类似，注意梯度方向取反
-```
-
-**C/MEX 层**：`mode_viscous_force` 无需修改，`wall_vel_x[jj]` 已作为参数传入。
-
-### 2.4 精度与局限
-
-- 精度：O(h)，与当前 Dirichlet 实现一致
-- 优点：改动最小，仅需在 MATLAB 层更新 wall_vel
-- 局限：虚粒子速度依赖当前流场，需每步更新；多层虚粒子的插值权重需仔细处理
-
----
-
-## 3. 方案 B：pair-wise tau 测量 + PI 输出 delta_tau 叠加 force_prior
+## 2. 方案 B：pair-wise tau 测量 + PI 输出 delta_tau 叠加 force_prior
 
 ### 3.1 物理原理
 
@@ -178,84 +120,7 @@ force_prior(near_bottom, 1) = force_prior(near_bottom, 1) + delta_tau_b * dp^2;
 
 ---
 
-## 4. 方案 C：Adami 广义壁面 BC（自适应插值）
-
-### 4.1 物理原理
-
-基于 Adami (2012, 2013) [1,11] 的广义壁面 BC 框架，虚粒子速度不固定，而是通过对周围流体粒子的核函数加权插值动态确定，并在其中嵌入 τ_w 约束。
-
-### 4.2 推导
-
-**步骤 1**：对虚粒子 j，插值周围流体粒子速度：
-
-$$\tilde{u}^j = \frac{\sum_{i \in fluid} u_i W_{ij}}{\sum_{i \in fluid} W_{ij}}$$
-
-**步骤 2**：Adami 无滑移条件为 $u_{ghost} = 2u_{wall} - \tilde{u}$，对于静止壁面 $u_{wall}=0$，得 $u_{ghost} = -\tilde{u}$。
-
-**步骤 3**：推广到 Neumann 条件。
-
-设流体粒子 i 到壁面距离为 $d_f = y_i$，虚粒子 j 到壁面距离为 $d_g = |y_j|$，两者关于壁面对称时 $d_f = d_g = d$。
-
-用镜像点线性插值近似壁面处梯度：
-
-$$\left.\frac{\partial u}{\partial y}\right|_{wall} \approx \frac{u_f - u_g}{d_f + d_g} = \frac{\tau_w}{\mu}$$
-
-用 $\tilde{u}$ 代替 $u_f$（SPH 加权插值），解出虚粒子速度：
-
-$$u_g = \tilde{u} - (d_f + d_g)\frac{\tau_w}{\mu}$$
-
-对称布置下 $d_f \approx d_g = d_j$，故：
-
-$$\boxed{u_{ghost}^j = \tilde{u}^j - 2d_j \cdot \frac{\tau_w}{\mu}}$$
-
-**验证**：τ_w=0 时 $u_{ghost}^j = \tilde{u}^j$，壁面处梯度为零（正确的零梯度 Neumann 极限）；τ_w≠0 且 $\tilde{u}=0$ 时 $u_{ghost}^j = -2d_j\tau_w/\mu < 0$，在壁面处产生正梯度，物理正确。
-
-**上壁面**（法向 -ŷ，du/dy|_{y=H} = -τ_w/μ）：
-
-$$u_{ghost}^j = \tilde{u}^j + 2d_j \cdot \frac{\tau_w}{\mu}$$
-
-### 4.3 代码修改位置
-
-**MATLAB 层**，在每个声学子步前更新 wall_vel：
-
-```matlab
-function wall_vel = update_wall_vel_neumann(pos, vel, wall_vel, ...
-        pair_i, pair_j, W_ij, n_fluid, n_total, tau_w, mu, DH)
-    % 对每个壁面虚粒子，插值流体速度并施加 Neumann 修正
-    sum_W  = zeros(n_total, 1);
-    sum_uW = zeros(n_total, 1);
-    for k = 1:numel(pair_i)
-        i = pair_i(k); j = pair_j(k);
-        if i <= n_fluid && j > n_fluid
-            sum_W(j)  = sum_W(j)  + W_ij(k);
-            sum_uW(j) = sum_uW(j) + vel(i,1) * W_ij(k);
-        end
-    end
-    for j = n_fluid+1 : n_total
-        if sum_W(j) > 1e-12
-            u_interp = sum_uW(j) / sum_W(j);
-            d_j = min(abs(pos(j,2)), abs(DH - pos(j,2)));
-            if pos(j, 2) < 0  % 下壁面
-                wall_vel(j, 1) = u_interp - 2*(tau_w/mu) * d_j;
-            else               % 上壁面
-                wall_vel(j, 1) = u_interp + 2*(tau_w/mu) * d_j;
-            end
-        end
-    end
-end
-```
-
-**C/MEX 层**：无需修改。
-
-### 4.4 精度与局限
-
-- 精度：插值本身为 O(h)；由于粘性壁面项仍使用经验 ×4 单侧补偿（`sph_physics_mex.c:514`，Morris et al. 1997 [3]），未引入半解析边界积分重归一化（参见 Ferrand et al. 2012 [2]、Leroy et al. 2014 [10]），**实际精度阶次待网格收敛验证后声明**
-- 优点：与 Adami 框架一致，物理上最严格；τ_w=0 极限正确退化为零梯度；自动适应流场变化
-- 局限：每步需要额外的插值循环（可向量化）；W_ij 需从邻居搜索结果传入
-
----
-
-## 5. 方案 D：虚粒子 wall_vel 修改法（Neumann BC 直接施加）
+## 3. 方案 D：虚粒子 wall_vel 修改法（Neumann BC 直接施加）
 
 ### 5.1 物理原理
 
@@ -318,25 +183,23 @@ end
 
 ---
 
-## 6. 方案对比
+## 4. 方案对比
 
-| 维度 | 方案 A（镜像速度） | 方案 B（PI+force_prior） | 方案 C（Adami 插值） | 方案 D（虚粒子 wall_vel） |
-|------|------------------|--------------------------|---------------------|--------------------------|
-| 理论基础 | 线性插值镜像 | 闭环 PI + 面力等效 | Adami 2012 广义 BC [1] | Adami 插值 + 梯度修正 |
-| 精度 | O(h)，待收敛验证 | L2=0.68%（dp=0.04，t=10s）✓ | 待网格收敛验证后声明 | 待验证 |
-| τ_w=0 极限 | 正确（零梯度） | 自动满足（PI 积分消除误差） | 正确（零梯度） | 正确（退化为方案 C） |
-| wall_vel | 动态设定 | 恒零（纯无滑移） | 动态设定（插值） | 动态设定（插值+梯度修正） |
-| 改动范围 | MATLAB 层 wall_vel | force_prior（MATLAB 层） | MATLAB 层 wall_vel | MATLAB 层 wall_vel |
-| MEX 修改 | 无 | 无 | 无 | 无 |
-| 计算开销 | 低 | 低（pair-wise 求和） | 中 | 中 |
-| 与现有框架兼容性 | 高 | 高 | 高 | 高 |
-| 实现难度 | 低 | 中（需标定 k_p、k_i） | 中 | 中 |
-| 适用场景 | 稳态/非稳态 | 稳态/准稳态 | 稳态/非稳态 | 稳态/非稳态 |
-| 推荐度 | 快速验证 | **当前实现（推荐）** | 生产使用备选 | 备选 |
+| 维度 | 方案 B（PI+force_prior） | 方案 D（虚粒子 wall_vel） |
+|------|--------------------------|--------------------------|
+| 理论基础 | 闭环 PI + 面力等效 | Adami 插值 + 梯度修正 |
+| 精度 | L2=0.68%（dp=0.04，t=10s）✓ | 待验证 |
+| τ_w=0 极限 | 自动满足（PI 积分消除误差） | 正确（退化为无滑移） |
+| wall_vel | 恒零（纯无滑移） | 动态设定（插值+梯度修正） |
+| 改动范围 | force_prior（MATLAB 层） | MATLAB 层 wall_vel |
+| MEX 修改 | 无 | 无 |
+| 控制类型 | 闭环 | 开环 |
+| 适用场景 | 稳态/准稳态 | 稳态/非稳态 |
+| 推荐度 | **当前实现（推荐）** | 备选 |
 
 ---
 
-## 7. 推荐实现路径
+## 5. 推荐实现路径
 
 **当前实现：方案 B（pair-wise tau 测量 + PI 输出 delta_tau 叠加 force_prior）**
 - 理由：wall_vel 恒零物理意义清晰；PI 积分消除稳态误差；实测 L2=0.68%，验证通过
@@ -346,12 +209,9 @@ end
 - 理由：开环前馈，每步精确，适合非稳态流动；与 Adami 框架一致
 - 实现步骤：在主循环中每个对流步开始前，对每个虚粒子插值流体速度并施加梯度修正
 
-**备选：方案 C（Adami 插值，τ_w=0 特例）**
-- 理由：方案 D 在 τ_w=0 时的退化形式，适合纯无滑移验证
-
 ---
 
-## 8. 参考文献
+## 6. 参考文献
 
 1. Adami, S., Hu, X.Y., Adams, N.A. (2012). "A generalized wall boundary condition for smoothed particle hydrodynamics." *J. Comput. Phys.*, 231(21), 7057-7075.
 2. Ferrand, M., Laurence, D.R., Rogers, B.D., Violeau, D., Kassiotis, C. (2012). "Unified semi-analytical wall boundary conditions for inviscid, laminar or turbulent flows in the meshless SPH method." *Int. J. Numer. Methods Fluids*, 71(4), 446-472.
