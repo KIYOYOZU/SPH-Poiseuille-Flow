@@ -17,7 +17,6 @@ tmp.*
 logs/
 
 # 文档草稿
-*.md
 !README.md
 
 # MATLAB 自动生成
@@ -34,3 +33,5 @@ result_*.png
 .claude/settings.local.json
 壁面边界条件报告.md
 restart.mat
+resolution_convergence.png
+resolution_results.mat

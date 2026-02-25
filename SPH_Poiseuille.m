@@ -151,7 +151,6 @@ if restart_from_file && exist(restart_path, 'file')
             t = state.t;
             step = state.step;
             % 恢复 PI 控制器状态（若旧 restart 文件无此字段则保持默认值）
-            if isfield(state, 'wall_vel'),  wall_vel = state.wall_vel;  end
             if isfield(state, 'I_bottom'),  I_bottom = state.I_bottom;  end
             if isfield(state, 'I_top'),     I_top    = state.I_top;     end
             if isfield(state, 'k_p'),       k_p      = state.k_p;       end
@@ -175,15 +174,15 @@ end
 p(1:n_fluid) = p0 * (rho(1:n_fluid) ./ rho0 - 1.0);
 p(n_fluid+1:end) = 0.0;
 
-% 方案 D' PI 控制器状态（Neumann BC：指定壁面切应力 tau_target）
+% 方案 D+B：pair-wise 测量 tau_num + PI 输出 delta_tau 叠加到 force_prior
 tau_target = gravity_g * rho0 * DH / 2;  % 泊肃叶流壁面切应力解析值 [Pa]
 I_bottom = 0.0;         % 积分项（下壁面）
 I_top    = 0.0;         % 积分项（上壁面）
 I_max    = 2.0;         % 积分限幅
 tau_num_bottom = 0.0;   % 监控变量初始化
 tau_num_top    = 0.0;
-k_p = 0.01;             % PI 增益初始值（首步后由 K_tau 重算）
-k_i = 0.0005;
+k_p = 0.5;              % PI 比例增益（delta_tau = k_p * e [Pa]，K_F≈1 故保守取 0.5）
+k_i = 0.025;            % PI 积分增益
 
 %% S6: 主循环（双层时间步进：外层对流步 + 内层声学步）
 % 外层：计算粘性力、传输修正、对流时间步长 Dt
@@ -215,7 +214,7 @@ while t < t_end - 1e-12
         force_prior = viscous_force;
         force_prior(1:n_fluid, 1) = force_prior(1:n_fluid, 1) + mass(1:n_fluid) * gravity_g;  % 叠加体积力
 
-        % === 方案 D'：pair-wise 粘性力统计 + PI 反馈调节壁面切应力 ===
+        % === 方案 D+B：pair-wise tau 测量 + PI 输出 delta_tau 叠加 force_prior ===
         % 下壁面：识别流固粒子对（j 是壁面粒子且 y_j < 0）
         is_bottom = (pair_j > n_fluid) & (pos(pair_j, 2) < 0);
         i_b = pair_i(is_bottom);
@@ -229,11 +228,9 @@ while t < t_end - 1e-12
             dv_x_b = vel(i_b,1) - wall_vel(j_b,1);
             f_pair_b = 4*mu .* eBe_b .* dW_b .* Vol(j_b) .* dv_x_b ...
                        ./ (r_b + 0.01*h) .* Vol(i_b);
-            tau_num_bottom = -sum(f_pair_b) / DL;  % 取负号：壁面切应力为正值
-            K_tau_b = sum(4*mu .* eBe_b .* dW_b .* Vol(j_b) ...
-                          ./ (r_b + 0.01*h) .* Vol(i_b)) / DL;
+            tau_num_bottom = -sum(f_pair_b) / DL;
         else
-            tau_num_bottom = 0.0;  K_tau_b = -1.0;
+            tau_num_bottom = 0.0;
         end
 
         % 上壁面：识别流固粒子对（j 是壁面粒子且 y_j > DH）
@@ -249,34 +246,25 @@ while t < t_end - 1e-12
             dv_x_t = vel(i_t,1) - wall_vel(j_t,1);
             f_pair_t = 4*mu .* eBe_t .* dW_t .* Vol(j_t) .* dv_x_t ...
                        ./ (r_t + 0.01*h) .* Vol(i_t);
-            tau_num_top = -sum(f_pair_t) / DL;  % 上壁面同样取负号（壁面减速流体）
+            tau_num_top = -sum(f_pair_t) / DL;
         else
             tau_num_top = 0.0;
         end
 
-        % PI 增益（首步估算，后续复用）
-        if step == 1
-            if abs(K_tau_b) < 1e-12, K_tau_b = -1.0; end
-            k_p = 0.5 / abs(K_tau_b);
-            k_i = 0.05 * k_p;
-        end
-
-        % PI 更新：下壁面
-        % PI 输出直接设定 wall_vel（非累加），防止无界漂移
+        % PI 更新：下壁面 → delta_tau_b [Pa] → 叠加到近壁流体粒子 force_prior
         e_b = tau_target - tau_num_bottom;
         I_bottom = max(-I_max, min(I_max, I_bottom + e_b * Dt));
-        v_wall_b = k_p * e_b + k_i * I_bottom;
-        bot_idx = find(pos(n_fluid+1:end, 2) < 0) + n_fluid;
-        wall_vel(bot_idx, 1) = v_wall_b;
+        delta_tau_b = k_p * e_b + k_i * I_bottom;
+        near_bottom = pos(1:n_fluid, 2) < 2*h;
+        force_prior(near_bottom, 1) = force_prior(near_bottom, 1) + delta_tau_b * dp^2;
 
-        % PI 更新：上壁面
-        % tau_num_top = -sum(f_pair_t)/DL，f_pair_t 正比于 (vel_i - wall_vel_j)
+        % PI 更新：上壁面 → delta_tau_t [Pa] → 叠加到近壁流体粒子 force_prior
         e_t = tau_target - tau_num_top;
         I_top = max(-I_max, min(I_max, I_top + e_t * Dt));
-        v_wall_t = k_p * e_t + k_i * I_top;
-        top_idx = find(pos(n_fluid+1:end, 2) > DH) + n_fluid;
-        wall_vel(top_idx, 1) = -v_wall_t;
-        % === 方案 D' 结束 ===
+        delta_tau_t = k_p * e_t + k_i * I_top;
+        near_top = pos(1:n_fluid, 2) > DH - 2*h;
+        force_prior(near_top, 1) = force_prior(near_top, 1) + delta_tau_t * dp^2;
+        % === 方案 D+B 结束 ===
 
         % 传输速度修正（抑制张力不稳定性）
         pos = feval(physics_mex_name, 'transport_correction', ...
@@ -319,7 +307,7 @@ while t < t_end - 1e-12
             relaxation_time = relaxation_time + dt;
         end
 
-        % 对流步结束：周期性边界 + 壁面防穿透 + 壁面速度重置
+        % 对流步结束：周期性边界 + 壁面防穿透 + 壁面速度重置（wall_vel 恒零，无滑移）
         [pos, ~] = periodic_bounding(pos, n_fluid, DL, periodic_buffer);
         pos = bounding_from_wall(pos, n_fluid, DH, dp);
         vel(n_fluid+1:end, :) = wall_vel(n_fluid+1:end, :);
@@ -337,8 +325,8 @@ while t < t_end - 1e-12
             vmax = max(vecnorm(vel(1:n_fluid, :), 2, 2));
             fprintf('step=%d, t=%.6f/%.6f, Dt=%.4e, pairs=%d, vmax=%.4f\n', ...
                 step, t, t_end, Dt, numel(pair_i), vmax);
-            fprintf('  tau_bot=%.4f, tau_top=%.4f, wall_vel_x=%.4f\n', ...
-                tau_num_bottom, tau_num_top, mean(wall_vel(bot_idx, 1)));
+            fprintf('  tau_bot=%.4f, tau_top=%.4f, tau_target=%.4f, e_b=%.4f\n', ...
+                tau_num_bottom, tau_num_top, tau_target, e_b);
         end
     end
 
@@ -353,7 +341,6 @@ while t < t_end - 1e-12
         'force_prior', force_prior, ...
         't', t, ...
         'step', step, ...
-        'wall_vel', wall_vel, ...
         'I_bottom', I_bottom, ...
         'I_top', I_top, ...
         'k_p', k_p, ...
@@ -369,22 +356,15 @@ fluid_vel = vel(1:n_fluid, :);
 
 n_bins = max(20, round(DH / dp));
 [y_mid, u_mean] = compute_binned_profile_mean(fluid_pos(:, 2), fluid_vel(:, 1), 0.0, DH, n_bins);
-% Neumann BC 下解析解：抛物线 + 稳态壁面速度偏移
-% 上下壁面速度取平均作为参考系偏移
-wall_vel_bot = mean(wall_vel(bot_idx, 1));
-wall_vel_top = mean(wall_vel(top_idx, 1));
-wall_vel_steady = (wall_vel_bot + wall_vel_top) / 2;
-u_exact = wall_vel_steady + gravity_g / (2.0 * nu) .* y_mid .* (DH - y_mid);
+% 无滑移 BC 下解析解：标准抛物线
+u_exact = gravity_g / (2.0 * nu) .* y_mid .* (DH - y_mid);
 
 valid = ~isnan(u_mean);
 if ~any(valid)
     error('后处理失败：速度剖面分箱为空。');
 end
 
-% L2 误差基于抛物线形状（去掉整体平移分量）
-u_mean_rel = u_mean(valid) - wall_vel_steady;
-u_exact_rel = gravity_g / (2.0 * nu) .* y_mid(valid) .* (DH - y_mid(valid));
-L2_error = sqrt(sum((u_mean_rel - u_exact_rel).^2) / max(sum(u_exact_rel.^2), eps));
+L2_error = sqrt(sum((u_mean(valid) - u_exact(valid)).^2) / max(sum(u_exact(valid).^2), eps));
 fprintf('L2 相对误差 = %.4f%%\n', 100.0 * L2_error);
 
 if L2_error < 0.05
