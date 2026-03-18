@@ -4,7 +4,8 @@ build/
 # 编译临时文件
 *.o
 *.obj
-
+*.exp
+*.lib
 # IDE 配置
 .vscode/
 .idea/
@@ -35,3 +36,13 @@ result_*.png
 restart.mat
 resolution_convergence.png
 resolution_results.mat
+.gitnexus
+**/docu/
+**/.claude/
+task_plan.md
+**/plan/
+findings.md
+progress.md
+CLAUDE.md
+.gitignore
+AGENTS.md

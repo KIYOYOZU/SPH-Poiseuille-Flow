@@ -18,6 +18,7 @@ mex_dir = fullfile(project_dir, 'mex');         % MEX C 源码目录
 config_path = fullfile(project_dir, 'config.ini');
 restart_path = fullfile(project_dir, 'restart.mat');
 result_png = fullfile(project_dir, 'SPH_Poiseuille_result.png');
+profile_evolution_png = fullfile(project_dir, 'SPH_centerline_profile_evolution.png');
 
 if ~exist(build_dir, 'dir')
     mkdir(build_dir);
@@ -47,6 +48,11 @@ t_end = get_ini_numeric(cfg, 'simulation', 'end_time');
 output_interval = get_ini_numeric(cfg, 'simulation', 'output_interval');
 sort_interval = round(get_ini_numeric(cfg, 'simulation', 'sort_interval'));
 restart_from_file = round(get_ini_numeric(cfg, 'simulation', 'restart_from_file'));
+bc_mode = get_ini_string(cfg, 'simulation', 'bc_mode');  % 'B' 或 'D'
+if ~ismember(bc_mode, {'B', 'D'})
+    error('bc_mode 必须为 B 或 D，当前值: %s', bc_mode);
+end
+fprintf('BC 模式: 方案%s\n', bc_mode);
 
 % 几何参数自动对齐：确保 DL/dp 和 DH/dp 为整数（周期边界 + 均匀粒子排列）
 DL_raw = DL;  DH_raw = DH;
@@ -174,15 +180,33 @@ end
 p(1:n_fluid) = p0 * (rho(1:n_fluid) ./ rho0 - 1.0);
 p(n_fluid+1:end) = 0.0;
 
-% 方案 B：pair-wise 测量 tau_num + PI 输出 delta_tau 叠加到 force_prior
+% 壁面切应力目标值（两种方案共用）
 tau_target = gravity_g * rho0 * DH / 2;  % 泊肃叶流壁面切应力解析值 [Pa]
-I_bottom = 0.0;         % 积分项（下壁面）
-I_top    = 0.0;         % 积分项（上壁面）
-I_max    = 2.0;         % 积分限幅
 tau_num_bottom = 0.0;   % 监控变量初始化
 tau_num_top    = 0.0;
-k_p = 0.5;              % PI 比例增益（delta_tau = k_p * e [Pa]，K_F≈1 故保守取 0.5）
-k_i = 0.025;            % PI 积分增益
+
+if strcmp(bc_mode, 'B')
+    % 方案 B：PI 控制器参数
+    I_bottom = 0.0;     % 积分项（下壁面）
+    I_top    = 0.0;     % 积分项（上壁面）
+    I_max    = 2.0;     % 积分限幅
+    k_p = 0.5;          % PI 比例增益
+    k_i = 0.025;        % PI 积分增益
+else
+    % 方案 D：无需 PI 参数，wall_vel 每步由 Adami 插值动态设定
+    I_bottom = 0.0; I_top = 0.0; k_p = 0.0; k_i = 0.0; I_max = 0.0;  % 占位，restart 兼容
+end
+
+% 槽道中间截面（x=DL/2）速度剖面演化记录：每个输出时刻保留一条 u(y)
+n_bins = max(20, round(DH / dp));
+mid_x = 0.5 * DL;
+mid_half_width = max(dp, h);
+profile_times = zeros(0, 1);
+mid_profile_u = NaN(n_bins, 0);
+[~, u_mid_init] = compute_mid_channel_profile( ...
+    pos(1:n_fluid, :), vel(1:n_fluid, 1), DL, DH, mid_x, mid_half_width, n_bins);
+profile_times(end + 1, 1) = t;
+mid_profile_u(:, end + 1) = u_mid_init;
 
 %% S6: 主循环（双层时间步进：外层对流步 + 内层声学步）
 % 外层：计算粘性力、传输修正、对流时间步长 Dt
@@ -208,14 +232,21 @@ while t < t_end - 1e-12
             mass, n_fluid, n_total, rho0, h, inv_sigma0);
 
         % 粘性力计算（含壁面无滑移镜像速度）
-        viscous_force = feval(physics_mex_name, 'viscous_force', ...
-            pair_i, pair_j, dx_ij, dy_ij, r_ij, dW_ij, ...
-            vel, Vol, B, mu, h, n_fluid, n_total, mass, wall_vel);
+        if strcmp(bc_mode, 'D')
+            viscous_force = feval(physics_mex_name, 'viscous_force', ...
+                pair_i, pair_j, dx_ij, dy_ij, r_ij, dW_ij, ...
+                vel, Vol, B, mu, h, n_fluid, n_total, mass, wall_vel, ...
+                pos, tau_target/mu, DH);
+        else
+            viscous_force = feval(physics_mex_name, 'viscous_force', ...
+                pair_i, pair_j, dx_ij, dy_ij, r_ij, dW_ij, ...
+                vel, Vol, B, mu, h, n_fluid, n_total, mass, wall_vel);
+        end
         force_prior = viscous_force;
         force_prior(1:n_fluid, 1) = force_prior(1:n_fluid, 1) + mass(1:n_fluid) * gravity_g;  % 叠加体积力
 
+        if strcmp(bc_mode, 'B')
         % === 方案 B：pair-wise tau 测量 + PI 输出 delta_tau 叠加 force_prior ===
-        % 下壁面：识别流固粒子对（j 是壁面粒子且 y_j < 0）
         is_bottom = (pair_j > n_fluid) & (pos(pair_j, 2) < 0);
         i_b = pair_i(is_bottom);
         j_b = pair_j(is_bottom);
@@ -232,8 +263,6 @@ while t < t_end - 1e-12
         else
             tau_num_bottom = 0.0;
         end
-
-        % 上壁面：识别流固粒子对（j 是壁面粒子且 y_j > DH）
         is_top = (pair_j > n_fluid) & (pos(pair_j, 2) > DH);
         i_t = pair_i(is_top);
         j_t = pair_j(is_top);
@@ -250,21 +279,54 @@ while t < t_end - 1e-12
         else
             tau_num_top = 0.0;
         end
-
-        % PI 更新：下壁面 → delta_tau_b [Pa] → 叠加到近壁流体粒子 force_prior
         e_b = tau_target - tau_num_bottom;
         I_bottom = max(-I_max, min(I_max, I_bottom + e_b * Dt));
         delta_tau_b = k_p * e_b + k_i * I_bottom;
         near_bottom = pos(1:n_fluid, 2) < 2*h;
         force_prior(near_bottom, 1) = force_prior(near_bottom, 1) + delta_tau_b * dp^2;
-
-        % PI 更新：上壁面 → delta_tau_t [Pa] → 叠加到近壁流体粒子 force_prior
         e_t = tau_target - tau_num_top;
         I_top = max(-I_max, min(I_max, I_top + e_t * Dt));
         delta_tau_t = k_p * e_t + k_i * I_top;
         near_top = pos(1:n_fluid, 2) > DH - 2*h;
         force_prior(near_top, 1) = force_prior(near_top, 1) + delta_tau_t * dp^2;
         % === 方案 B 结束 ===
+
+        else
+        % === 方案 D：wall_vel 置零，MEX 内部用显式镜像+梯度修正 ===
+        % u_ghost = -v_i ± G*d_j，u_wall=0 精确锚定，梯度通过虚粒子施加
+        wall_vel(n_fluid+1:end, :) = 0;
+        % 监控：pair-wise 测量下壁面和上壁面 tau_num（仅用于输出）
+        is_bottom = (pair_j > n_fluid) & (pos(pair_j, 2) < 0);
+        i_b = pair_i(is_bottom); j_b = pair_j(is_bottom);
+        if ~isempty(i_b)
+            r_b = r_ij(is_bottom); dW_b = dW_ij(is_bottom);
+            dx_b = dx_ij(is_bottom); dy_b = dy_ij(is_bottom);
+            ex_b = dx_b./r_b; ey_b = dy_b./r_b;
+            eBe_b = ex_b.*(B(i_b,1).*ex_b+B(i_b,2).*ey_b) + ...
+                    ey_b.*(B(i_b,3).*ex_b+B(i_b,4).*ey_b);
+            f_pair_b = 4*mu.*eBe_b.*dW_b.*Vol(j_b).*(vel(i_b,1)-wall_vel(j_b,1)) ...
+                       ./(r_b+0.01*h).*Vol(i_b);
+            tau_num_bottom = -sum(f_pair_b) / DL;
+        else
+            tau_num_bottom = 0.0;
+        end
+        is_top = (pair_j > n_fluid) & (pos(pair_j, 2) > DH);
+        i_t = pair_i(is_top); j_t = pair_j(is_top);
+        if ~isempty(i_t)
+            r_t = r_ij(is_top); dW_t = dW_ij(is_top);
+            dx_t = dx_ij(is_top); dy_t = dy_ij(is_top);
+            ex_t = dx_t./r_t; ey_t = dy_t./r_t;
+            eBe_t = ex_t.*(B(i_t,1).*ex_t+B(i_t,2).*ey_t) + ...
+                    ey_t.*(B(i_t,3).*ex_t+B(i_t,4).*ey_t);
+            f_pair_t = 4*mu.*eBe_t.*dW_t.*Vol(j_t).*(vel(i_t,1)-wall_vel(j_t,1)) ...
+                       ./(r_t+0.01*h).*Vol(i_t);
+            tau_num_top = sum(f_pair_t) / DL;
+        else
+            tau_num_top = 0.0;
+        end
+        e_b = tau_target - tau_num_bottom;  % 仅用于日志
+        % === 方案 D 结束 ===
+        end
 
         % 传输速度修正（抑制张力不稳定性）
         pos = feval(physics_mex_name, 'transport_correction', ...
@@ -307,10 +369,15 @@ while t < t_end - 1e-12
             relaxation_time = relaxation_time + dt;
         end
 
-        % 对流步结束：周期性边界 + 壁面防穿透 + 壁面速度重置（wall_vel 恒零，无滑移）
+        % 对流步结束：周期性边界 + 壁面防穿透
         [pos, ~] = periodic_bounding(pos, n_fluid, DL, periodic_buffer);
         pos = bounding_from_wall(pos, n_fluid, DH, dp);
-        vel(n_fluid+1:end, :) = wall_vel(n_fluid+1:end, :);
+        % 方案B：wall_vel 恒零，重置虚粒子速度；方案D：wall_vel 已动态设定，保持不变
+        if strcmp(bc_mode, 'B')
+            vel(n_fluid+1:end, :) = zeros(n_wall, 2);
+        else
+            vel(n_fluid+1:end, :) = wall_vel(n_fluid+1:end, :);
+        end
 
         % 定期按空间网格排序粒子（提升缓存命中率）
         if mod(step, sort_interval) == 0 && step ~= 1
@@ -325,8 +392,13 @@ while t < t_end - 1e-12
             vmax = max(vecnorm(vel(1:n_fluid, :), 2, 2));
             fprintf('step=%d, t=%.6f/%.6f, Dt=%.4e, pairs=%d, vmax=%.4f\n', ...
                 step, t, t_end, Dt, numel(pair_i), vmax);
-            fprintf('  tau_bot=%.4f, tau_top=%.4f, tau_target=%.4f, e_b=%.4f\n', ...
-                tau_num_bottom, tau_num_top, tau_target, e_b);
+            if strcmp(bc_mode, 'B')
+                fprintf('  [B] tau_bot=%.4f, tau_top=%.4f, tau_target=%.4f, e_b=%.4f\n', ...
+                    tau_num_bottom, tau_num_top, tau_target, e_b);
+            else
+                fprintf('  [D] tau_bot=%.4f, tau_top=%.4f, tau_target=%.4f, e_b=%.4f\n', ...
+                    tau_num_bottom, tau_num_top, tau_target, e_b);
+            end
         end
     end
 
@@ -346,6 +418,11 @@ while t < t_end - 1e-12
         'k_p', k_p, ...
         'k_i', k_i);
     save_restart(restart_path, config_signature, state);
+
+    [~, u_mid_now] = compute_mid_channel_profile( ...
+        pos(1:n_fluid, :), vel(1:n_fluid, 1), DL, DH, mid_x, mid_half_width, n_bins);
+    profile_times(end + 1, 1) = t;
+    mid_profile_u(:, end + 1) = u_mid_now;
 end
 
 %% S7: 后处理与验证
@@ -354,7 +431,6 @@ fluid_pos = pos(1:n_fluid, :);
 fluid_pos(:, 1) = mod(fluid_pos(:, 1), DL);
 fluid_vel = vel(1:n_fluid, :);
 
-n_bins = max(20, round(DH / dp));
 [y_mid, u_mean] = compute_binned_profile_mean(fluid_pos(:, 2), fluid_vel(:, 1), 0.0, DH, n_bins);
 % 无滑移 BC 下解析解：标准抛物线
 u_exact = gravity_g / (2.0 * nu) .* y_mid .* (DH - y_mid);
@@ -478,6 +554,53 @@ title(ax2, '(b) Velocity field', 'FontName', 'Times New Roman', ...
 saveas(fig, result_png);
 fprintf('结果图已保存: %s\n', result_png);
 
+% --- 中间截面速度剖面演化图（每个时间一条剖面） ---
+fig_evo = figure('Color', 'w', 'Position', [140, 140, 760, 560], 'Renderer', 'painters');
+ax_evo = axes(fig_evo);
+hold(ax_evo, 'on');
+
+tvals = profile_times(:)';
+n_profiles = numel(tvals);
+line_cmap = parula(max(n_profiles, 2));
+
+for k = 1:n_profiles
+    u_k = mid_profile_u(:, k) / U_max;
+    valid_k = ~isnan(u_k);
+    if any(valid_k)
+        plot(ax_evo, u_k(valid_k), y_mid(valid_k) / DH, '-', ...
+            'Color', line_cmap(k, :), 'LineWidth', 1.0);
+    end
+end
+
+plot(ax_evo, u_norm_exact, y_norm, '--', 'Color', [0.1 0.1 0.1], 'LineWidth', 1.6);
+hold(ax_evo, 'off');
+
+set(ax_evo, 'FontName', 'Times New Roman', 'FontSize', 13, 'LineWidth', 1.0, ...
+    'TickDir', 'in', 'TickLength', [0.015 0.015], 'Box', 'on');
+xlabel(ax_evo, '$u_x / U_{max}$', 'Interpreter', 'latex', 'FontSize', 14);
+ylabel(ax_evo, '$y / H$', 'Interpreter', 'latex', 'FontSize', 14);
+xlim(ax_evo, [-0.05, 1.15]);
+ylim(ax_evo, [0, 1]);
+title(ax_evo, '(c) Mid-channel profile evolution', 'FontName', 'Times New Roman', ...
+    'FontSize', 13, 'FontWeight', 'normal');
+
+colormap(ax_evo, line_cmap);
+t_min = min(tvals);
+t_max = max(tvals);
+if t_max <= t_min
+    t_max = t_min + 1.0;
+end
+caxis(ax_evo, [t_min, t_max]);
+cb_evo = colorbar(ax_evo);
+cb_evo.Label.String = '$t$ (s)';
+cb_evo.Label.Interpreter = 'latex';
+cb_evo.Label.FontSize = 12;
+set(cb_evo, 'FontName', 'Times New Roman', 'FontSize', 11, ...
+    'TickDirection', 'in', 'LineWidth', 1.0);
+
+saveas(fig_evo, profile_evolution_png);
+fprintf('中间截面剖面演化图已保存: %s\n', profile_evolution_png);
+
 %% Local Functions
 function ensure_mex_compiled(src_path, out_name, build_dir)
     if ~exist(src_path, 'file')
@@ -568,6 +691,20 @@ function cfg = parse_ini(filename)
             cfg.(section).(key) = val_raw;
         end
     end
+end
+
+function value = get_ini_string(cfg, section, key)
+    if ~isfield(cfg, section)
+        error('缺少段: [%s]', section);
+    end
+    if ~isfield(cfg.(section), key)
+        error('缺少键: [%s].%s', section, key);
+    end
+    value = cfg.(section).(key);
+    if ~ischar(value)
+        value = num2str(value);
+    end
+    value = strtrim(value);
 end
 
 function value = get_ini_numeric(cfg, section, key)
@@ -686,6 +823,21 @@ function [y_mid, u_mean] = compute_binned_profile_mean(y_values, u_values, y_min
     cnt_u = accumarray(bin_id(~isnan(bin_id)), 1, [n_bins, 1], @sum, 0);
     u_mean = sum_u ./ max(cnt_u, 1);
     u_mean(cnt_u == 0) = NaN;
+end
+
+function [y_mid, u_mean] = compute_mid_channel_profile(pos, u_x, DL, DH, mid_x, half_width, n_bins)
+% 提取 x=mid_x 附近竖向切片上的 u(y) 速度剖面
+    x_wrap = mod(pos(:, 1), DL);
+    dx_mid = abs(x_wrap - mid_x);
+    dx_mid = min(dx_mid, DL - dx_mid);
+    is_mid = (dx_mid <= half_width);
+
+    if ~any(is_mid)
+        [y_mid, u_mean] = compute_binned_profile_mean([], [], 0.0, DH, n_bins);
+        return;
+    end
+
+    [y_mid, u_mean] = compute_binned_profile_mean(pos(is_mid, 2), u_x(is_mid), 0.0, DH, n_bins);
 end
 
 function save_restart(restart_path, config_signature, state)

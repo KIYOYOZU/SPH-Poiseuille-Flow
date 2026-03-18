@@ -409,9 +409,14 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
     double *acc_x;
     double *acc_y;
     int k;  /* Changed from mwSize to int for OpenMP compatibility */
+    /* 方案D可选参数：pos[n_total×2], G=tau/mu, DH */
+    int use_neumann = 0;
+    const double *pos_arr = NULL;
+    double G_neumann = 0.0;
+    double DH_neumann = 0.0;
 
-    require_count(nrhs == 16, "SPH:Physics:viscous:nrhs",
-                  "viscous_force expects 16 inputs after mode.");
+    require_count(nrhs == 16 || nrhs == 19, "SPH:Physics:viscous:nrhs",
+                  "viscous_force expects 16 or 19 inputs after mode.");
     require_count(nlhs == 1, "SPH:Physics:viscous:nlhs",
                   "viscous_force expects 1 output.");
 
@@ -437,6 +442,14 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
                   "SPH:Physics:viscous:mass", "mass size mismatch.");
     require_count(mxGetM(prhs[15]) == (mwSize)n_total && mxGetN(prhs[15]) == 2,
                   "SPH:Physics:viscous:wallvel", "wall_vel size mismatch.");
+
+    /* 方案D：可选 Neumann BC 参数 */
+    if (nrhs == 19) {
+        pos_arr    = mxGetDoubles(prhs[16]);
+        G_neumann  = mxGetScalar(prhs[17]);
+        DH_neumann = mxGetScalar(prhs[18]);
+        use_neumann = 1;
+    }
 
     plhs[0] = mxCreateDoubleMatrix(n_total, 2, mxREAL);
     force_out = mxGetDoubles(plhs[0]);
@@ -509,10 +522,32 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
         } else {
             double eBe = ex * (b11i * ex + b12i * ey) + ey * (b21i * ex + b22i * ey);
             double denom = rk + 0.01 * h;
-            double dvx = vel_x[ii] - wall_vel_x[jj];
-            double dvy = vel_y[ii] - wall_vel_y[jj];
-            double coeff = 4.0 * eBe * mu * dWk * Vol[jj] / denom;
-
+            double dvx, dvy, coeff;
+            if (use_neumann) {
+                /* 方案D：显式 Adami 镜像 + Neumann 梯度修正，严格保证 u_wall=0
+                 * pos 列优先：pos_x=pos_arr[jj], pos_y=pos_arr[jj+n_total]
+                 * 下壁面(y_j<0)：u_ghost = -u_tilde - G*d_j
+                 *   → u_wall = (u_ghost+u_tilde)/2 = -G*d_j/2 ≈ 0（d_j→0时精确）
+                 *   实际用 u_ghost = -vel_x[ii] - G*d_j（u_tilde≈vel_x[ii]）
+                 * 上壁面(y_j>DH)：u_ghost = -u_tilde + G*d_j
+                 *   实际用 u_ghost = -vel_x[ii] + G*d_j
+                 * dvx = vel_x[ii] - u_ghost，coeff 用 2.0（dvx含2倍因子）
+                 */
+                double y_j = pos_arr[jj + n_total];
+                double d_j = (y_j < 0.0) ? -y_j : y_j - DH_neumann;
+                double u_ghost;
+                if (y_j < 0.0)
+                    u_ghost = -vel_x[ii] - G_neumann * d_j;
+                else
+                    u_ghost = -vel_x[ii] + G_neumann * d_j;
+                dvx = vel_x[ii] - u_ghost;
+                dvy = vel_y[ii] - wall_vel_y[jj];
+                coeff = 2.0 * eBe * mu * dWk * Vol[jj] / denom;
+            } else {
+                dvx = vel_x[ii] - wall_vel_x[jj];
+                dvy = vel_y[ii] - wall_vel_y[jj];
+                coeff = 4.0 * eBe * mu * dWk * Vol[jj] / denom;
+            }
             #ifdef _OPENMP
             #pragma omp atomic
             #endif
