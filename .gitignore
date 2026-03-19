@@ -46,3 +46,6 @@ progress.md
 CLAUDE.md
 .gitignore
 AGENTS.md
+**/tests/
+**/specs/
+**/tasks/

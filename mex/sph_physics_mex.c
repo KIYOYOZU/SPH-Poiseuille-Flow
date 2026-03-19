@@ -410,8 +410,8 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
     double *acc_y;
     int k;  /* Changed from mwSize to int for OpenMP compatibility */
 
-    require_count(nrhs == 16, "SPH:Physics:viscous:nrhs",
-                  "viscous_force expects 16 inputs after mode.");
+    require_count(nrhs == 16 || nrhs == 17, "SPH:Physics:viscous:nrhs",
+                  "viscous_force expects 15 inputs after mode.");
     require_count(nlhs == 1, "SPH:Physics:viscous:nlhs",
                   "viscous_force expects 1 output.");
 
@@ -1095,6 +1095,339 @@ static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxAr
     mxFree(drho_rate);
 }
 
+/*
+ * mode_advance_shell_step
+ * 单步物理推进门面：
+ *   density_correction -> viscous_force -> transport_correction
+ *   -> integration_1st -> velocity update -> integration_2nd
+ *
+ * 说明：
+ *   - 仅负责单步物理推进，不处理周期包裹、壁面 bounding、排序与邻居重建。
+ *   - 当前实现优先复用现有 mode，减少对已验证数值内核的侵入。
+ *
+ * 输入（prhs[1..23]）：
+ *   pair_i, pair_j, dx, dy, r, W, dW,
+ *   mass, pos, vel, wall_vel, rho, drho_dt,
+ *   dt, n_fluid, n_total, rho0, p0, c_f, mu, h, inv_sigma0, gravity_g
+ *
+ * 输出（plhs[0..8]）：
+ *   rho, p, pos, vel, drho_dt, force, force_prior, Vol, B
+ */
+static void mode_advance_shell_step(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
+{
+    const double *mass;
+    double gravity_g;
+    double dt;
+    int n_fluid;
+    int n_total;
+
+    mxArray *density_mode = NULL;
+    mxArray *viscous_mode = NULL;
+    mxArray *transport_mode = NULL;
+    mxArray *int1_mode = NULL;
+    mxArray *int2_mode = NULL;
+    mxArray *vel_out = NULL;
+    mxArray *rho_out = NULL;
+
+    mxArray *density_plhs[3] = {NULL, NULL, NULL};
+    mxArray *viscous_plhs[1] = {NULL};
+    mxArray *transport_plhs[1] = {NULL};
+    mxArray *int1_plhs[5] = {NULL, NULL, NULL, NULL, NULL};
+    mxArray *int2_plhs[3] = {NULL, NULL, NULL};
+
+    const mxArray *density_prhs[14];
+    const mxArray *viscous_prhs[16];
+    const mxArray *transport_prhs[13];
+    const mxArray *int1_prhs[22];
+    const mxArray *int2_prhs[15];
+
+    require_count(nrhs == 24, "SPH:Physics:advance:nrhs",
+                  "advance_shell_step expects 23 inputs after mode.");
+    require_count(nlhs == 9, "SPH:Physics:advance:nlhs",
+                  "advance_shell_step expects 9 outputs.");
+
+    mass = mxGetDoubles(prhs[8]);
+    dt = mxGetScalar(prhs[14]);
+    n_fluid = (int)mxGetScalar(prhs[15]);
+    n_total = (int)mxGetScalar(prhs[16]);
+    gravity_g = mxGetScalar(prhs[23]);
+
+    require_count(mxGetNumberOfElements(prhs[8]) == (mwSize)n_total,
+                  "SPH:Physics:advance:mass", "mass size mismatch.");
+    require_count(mxGetM(prhs[9]) == (mwSize)n_total && mxGetN(prhs[9]) == 2,
+                  "SPH:Physics:advance:pos", "pos size mismatch.");
+    require_count(mxGetM(prhs[10]) == (mwSize)n_total && mxGetN(prhs[10]) == 2,
+                  "SPH:Physics:advance:vel", "vel size mismatch.");
+    require_count(mxGetM(prhs[11]) == (mwSize)n_total && mxGetN(prhs[11]) == 2,
+                  "SPH:Physics:advance:wall_vel", "wall_vel size mismatch.");
+    require_count(mxGetNumberOfElements(prhs[12]) == (mwSize)n_total,
+                  "SPH:Physics:advance:rho", "rho size mismatch.");
+    require_count(mxGetNumberOfElements(prhs[13]) == (mwSize)n_total,
+                  "SPH:Physics:advance:drho_dt", "drho_dt size mismatch.");
+    require_count(n_fluid > 0 && n_total >= n_fluid,
+                  "SPH:Physics:advance:count", "Invalid n_fluid/n_total.");
+
+    density_mode = mxCreateString("density_correction");
+    density_prhs[0] = density_mode;
+    density_prhs[1] = prhs[1];
+    density_prhs[2] = prhs[2];
+    density_prhs[3] = prhs[3];
+    density_prhs[4] = prhs[4];
+    density_prhs[5] = prhs[5];
+    density_prhs[6] = prhs[6];
+    density_prhs[7] = prhs[7];
+    density_prhs[8] = prhs[8];
+    density_prhs[9] = prhs[15];
+    density_prhs[10] = prhs[16];
+    density_prhs[11] = prhs[17];
+    density_prhs[12] = prhs[21];
+    density_prhs[13] = prhs[22];
+    mode_density_correction(3, density_plhs, 14, density_prhs);
+
+    viscous_mode = mxCreateString("viscous_force");
+    viscous_prhs[0] = viscous_mode;
+    viscous_prhs[1] = prhs[1];
+    viscous_prhs[2] = prhs[2];
+    viscous_prhs[3] = prhs[3];
+    viscous_prhs[4] = prhs[4];
+    viscous_prhs[5] = prhs[5];
+    viscous_prhs[6] = prhs[7];
+    viscous_prhs[7] = prhs[10];
+    viscous_prhs[8] = density_plhs[1];
+    viscous_prhs[9] = density_plhs[2];
+    viscous_prhs[10] = prhs[20];
+    viscous_prhs[11] = prhs[21];
+    viscous_prhs[12] = prhs[15];
+    viscous_prhs[13] = prhs[16];
+    viscous_prhs[14] = prhs[8];
+    viscous_prhs[15] = prhs[11];
+    mode_viscous_force(1, viscous_plhs, 16, viscous_prhs);
+
+    {
+        double *force_prior = mxGetDoubles(viscous_plhs[0]);
+        for (int i = 0; i < n_fluid; ++i) {
+            force_prior[i] += mass[i] * gravity_g;
+        }
+    }
+
+    transport_mode = mxCreateString("transport_correction");
+    transport_prhs[0] = transport_mode;
+    transport_prhs[1] = prhs[1];
+    transport_prhs[2] = prhs[2];
+    transport_prhs[3] = prhs[3];
+    transport_prhs[4] = prhs[4];
+    transport_prhs[5] = prhs[5];
+    transport_prhs[6] = prhs[7];
+    transport_prhs[7] = density_plhs[1];
+    transport_prhs[8] = density_plhs[2];
+    transport_prhs[9] = prhs[9];
+    transport_prhs[10] = prhs[21];
+    transport_prhs[11] = prhs[15];
+    transport_prhs[12] = prhs[16];
+    mode_transport_correction(1, transport_plhs, 13, transport_prhs);
+
+    int1_mode = mxCreateString("integration_1st");
+    int1_prhs[0] = int1_mode;
+    int1_prhs[1] = prhs[1];
+    int1_prhs[2] = prhs[2];
+    int1_prhs[3] = prhs[3];
+    int1_prhs[4] = prhs[4];
+    int1_prhs[5] = prhs[5];
+    int1_prhs[6] = prhs[7];
+    int1_prhs[7] = density_plhs[1];
+    int1_prhs[8] = density_plhs[2];
+    int1_prhs[9] = density_plhs[0];
+    int1_prhs[10] = prhs[8];
+    int1_prhs[11] = transport_plhs[0];
+    int1_prhs[12] = prhs[10];
+    int1_prhs[13] = prhs[13];
+    int1_prhs[14] = viscous_plhs[0];
+    int1_prhs[15] = prhs[14];
+    int1_prhs[16] = prhs[15];
+    int1_prhs[17] = prhs[16];
+    int1_prhs[18] = prhs[17];
+    int1_prhs[19] = prhs[18];
+    int1_prhs[20] = prhs[19];
+    int1_prhs[21] = prhs[11];
+    mode_integration_1st(5, int1_plhs, 22, int1_prhs);
+
+    vel_out = mxDuplicateArray(prhs[10]);
+    {
+        double *vel_data = mxGetDoubles(vel_out);
+        const double *force_prior = mxGetDoubles(viscous_plhs[0]);
+        const double *force_data = mxGetDoubles(int1_plhs[3]);
+        double *vel_x = vel_data;
+        double *vel_y = vel_data + n_total;
+        const double *force_prior_x = force_prior;
+        const double *force_prior_y = force_prior + n_total;
+        const double *force_x = force_data;
+        const double *force_y = force_data + n_total;
+
+        for (int i = 0; i < n_fluid; ++i) {
+            double inv_mass = 1.0 / mass[i];
+            vel_x[i] += (force_prior_x[i] + force_x[i]) * inv_mass * dt;
+            vel_y[i] += (force_prior_y[i] + force_y[i]) * inv_mass * dt;
+        }
+        for (int i = n_fluid; i < n_total; ++i) {
+            vel_x[i] = 0.0;
+            vel_y[i] = 0.0;
+        }
+    }
+
+    int2_mode = mxCreateString("integration_2nd");
+    int2_prhs[0] = int2_mode;
+    int2_prhs[1] = prhs[1];
+    int2_prhs[2] = prhs[2];
+    int2_prhs[3] = prhs[3];
+    int2_prhs[4] = prhs[4];
+    int2_prhs[5] = prhs[5];
+    int2_prhs[6] = prhs[7];
+    int2_prhs[7] = density_plhs[1];
+    int2_prhs[8] = int1_plhs[0];
+    int2_prhs[9] = int1_plhs[2];
+    int2_prhs[10] = vel_out;
+    int2_prhs[11] = prhs[14];
+    int2_prhs[12] = prhs[15];
+    int2_prhs[13] = prhs[16];
+    int2_prhs[14] = prhs[11];
+    mode_integration_2nd(3, int2_plhs, 15, int2_prhs);
+
+    rho_out = mxDuplicateArray(int1_plhs[0]);
+    {
+        double *rho_data = mxGetDoubles(rho_out);
+        const double *drho_data = mxGetDoubles(int2_plhs[1]);
+        for (int i = 0; i < n_fluid; ++i) {
+            rho_data[i] += drho_data[i] * (0.5 * dt);
+        }
+    }
+
+    plhs[0] = rho_out;
+    plhs[1] = int1_plhs[1];
+    plhs[2] = int2_plhs[0];
+    plhs[3] = vel_out;
+    plhs[4] = int2_plhs[1];
+    plhs[5] = int1_plhs[3];
+    plhs[6] = viscous_plhs[0];
+    plhs[7] = density_plhs[1];
+    plhs[8] = density_plhs[2];
+
+    mxDestroyArray(density_mode);
+    mxDestroyArray(viscous_mode);
+    mxDestroyArray(transport_mode);
+    mxDestroyArray(int1_mode);
+    mxDestroyArray(int2_mode);
+    mxDestroyArray(density_plhs[0]);
+    mxDestroyArray(transport_plhs[0]);
+    mxDestroyArray(int1_plhs[0]);
+    mxDestroyArray(int1_plhs[2]);
+    mxDestroyArray(int1_plhs[4]);
+    mxDestroyArray(int2_plhs[2]);
+}
+
+/*
+ * mode_wall_shear_monitor
+ * 统计上下壁面剪应力，仅用于日志与监控，不修改状态。
+ *
+ * 输入（prhs[1..16]）：
+ *   pair_i, pair_j, dx, dy, r, dW,
+ *   pos, vel, wall_vel, Vol, B,
+ *   n_fluid, DL, DH, mu, h
+ *
+ * 输出（plhs[0..1]）：
+ *   tau_bottom, tau_top
+ */
+static void mode_wall_shear_monitor(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
+{
+    const double *pair_i;
+    const double *pair_j;
+    const double *dx;
+    const double *dy;
+    const double *r;
+    const double *dW;
+    mwSize n_pairs;
+    const double *pos;
+    const double *vel;
+    const double *wall_vel;
+    const double *Vol;
+    const double *B;
+    int n_fluid;
+    mwSize n_total;
+    double DL;
+    double DH;
+    double mu;
+    double h;
+    const double *pos_y;
+    const double *vel_x;
+    const double *wall_vel_x;
+    double tau_bottom_sum = 0.0;
+    double tau_top_sum = 0.0;
+
+    require_count(nrhs == 17, "SPH:Physics:wallshear:nrhs",
+                  "wall_shear_monitor expects 16 inputs after mode.");
+    require_count(nlhs == 2, "SPH:Physics:wallshear:nlhs",
+                  "wall_shear_monitor expects 2 outputs.");
+
+    get_pair_data(prhs[1], prhs[2], prhs[3], prhs[4], prhs[5], prhs[6],
+                  &pair_i, &pair_j, &dx, &dy, &r, &dW, &n_pairs);
+    pos = mxGetDoubles(prhs[7]);
+    vel = mxGetDoubles(prhs[8]);
+    wall_vel = mxGetDoubles(prhs[9]);
+    Vol = mxGetDoubles(prhs[10]);
+    B = mxGetDoubles(prhs[11]);
+    n_fluid = (int)mxGetScalar(prhs[12]);
+    n_total = mxGetNumberOfElements(prhs[10]);
+    DL = mxGetScalar(prhs[13]);
+    DH = mxGetScalar(prhs[14]);
+    mu = mxGetScalar(prhs[15]);
+    h = mxGetScalar(prhs[16]);
+
+    require_count(DL > 0.0 && h > 0.0,
+                  "SPH:Physics:wallshear:param", "DL and h must be positive.");
+    require_count(mxGetM(prhs[7]) == n_total && mxGetN(prhs[7]) == 2,
+                  "SPH:Physics:wallshear:pos", "pos size mismatch.");
+    require_count(mxGetM(prhs[8]) == n_total && mxGetN(prhs[8]) == 2,
+                  "SPH:Physics:wallshear:vel", "vel size mismatch.");
+    require_count(mxGetM(prhs[9]) == n_total && mxGetN(prhs[9]) == 2,
+                  "SPH:Physics:wallshear:wall_vel", "wall_vel size mismatch.");
+    require_count(mxGetM(prhs[11]) == n_total && mxGetN(prhs[11]) == 4,
+                  "SPH:Physics:wallshear:B", "B size mismatch.");
+
+    pos_y = pos + n_total;
+    vel_x = vel;
+    wall_vel_x = wall_vel;
+
+    for (mwSize k = 0; k < n_pairs; ++k) {
+        int ii = (int)pair_i[k] - 1;
+        int jj = (int)pair_j[k] - 1;
+        double rk = r[k];
+        double ex, ey;
+        double eBe;
+        double dv_x;
+        double f_pair;
+
+        if (ii < 0 || ii >= n_fluid || jj < n_fluid || rk <= 1e-12) {
+            continue;
+        }
+
+        ex = dx[k] / rk;
+        ey = dy[k] / rk;
+        eBe = ex * (B[ii] * ex + B[ii + n_total] * ey) +
+              ey * (B[ii + 2 * n_total] * ex +
+                    B[ii + 3 * n_total] * ey);
+        dv_x = vel_x[ii] - wall_vel_x[jj];
+        f_pair = 4.0 * mu * eBe * dW[k] * Vol[jj] * dv_x / (rk + 0.01 * h) * Vol[ii];
+
+        if (pos_y[jj] < 0.0) {
+            tau_bottom_sum += f_pair;
+        } else if (pos_y[jj] > DH) {
+            tau_top_sum += f_pair;
+        }
+    }
+
+    plhs[0] = mxCreateDoubleScalar(-tau_bottom_sum / DL);
+    plhs[1] = mxCreateDoubleScalar(-tau_top_sum / DL);
+}
+
 void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
     char mode[64];
@@ -1113,6 +1446,10 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         mode_integration_1st(nlhs, plhs, nrhs, prhs);
     } else if (strcmp(mode, "integration_2nd") == 0) {
         mode_integration_2nd(nlhs, plhs, nrhs, prhs);
+    } else if (strcmp(mode, "advance_shell_step") == 0) {
+        mode_advance_shell_step(nlhs, plhs, nrhs, prhs);
+    } else if (strcmp(mode, "wall_shear_monitor") == 0) {
+        mode_wall_shear_monitor(nlhs, plhs, nrhs, prhs);
     } else {
         mexErrMsgIdAndTxt("SPH:Physics:mode", "Unsupported mode.");
     }

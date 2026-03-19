@@ -34,7 +34,7 @@ $$u(y) = \frac{g}{2\nu} y(H - y)$$
 ### 核心算法
 - **核函数：** 2D Cubic Spline (Wendland C2)
 - **邻居搜索：** Cell-Linked List（网格链表法），支持周期性边界
-- **计算加速：** 模块化 MEX（邻居搜索 + 物理计算分离调用）+ OpenMP 多线程
+- **计算加速：** 模块化 MEX（邻居搜索 + 高层物理门面 + OpenMP 多线程）
 - **时间积分：** 单层 CFL 时间步进（CFL = 0.3）
   - 统一时间步：`dt = 0.3 * h / (c_f + |u|_max)`，并按输出点与终止时间裁剪
 - **密度计算：** 核函数求和 + 核梯度修正（Kernel Gradient Correction）
@@ -47,6 +47,7 @@ $$u(y) = \frac{g}{2\nu} y(H - y)$$
 
 ### 架构特点
 - **配置驱动：** 所有参数通过 `config.ini` 配置
+- **单主文件壳层：** `SPH_Poiseuille.m` 负责配置、初始化、主循环框架、监控与后处理，保留 `local functions` 完成组织
 - **Restart 机制：** 支持从断点续算（带配置签名验证）
 - **粒子排序：** 定期按 Cell ID 排序提升缓存命中率
 - **自动编译：** MEX 模块首次运行时自动检测并编译
@@ -95,16 +96,16 @@ matlab -batch "run('SPH_Poiseuille.m')"
 ```matlab
 % Windows (MSVC)
 mex -R2018a -O COMPFLAGS="$COMPFLAGS /openmp" -output sph_neighbor_search_mex -outdir build mex/sph_neighbor_search_mex.c
-mex -R2018a -O COMPFLAGS="$COMPFLAGS /openmp" -output sph_physics_mex -outdir build mex/sph_physics_mex.c
+mex -R2018a -O COMPFLAGS="$COMPFLAGS /openmp" -output sph_physics_shell_mex -outdir build mex/sph_physics_mex.c
 
 % Linux/macOS (GCC)
 mex -R2018a -O CFLAGS="$CFLAGS -fopenmp" LDFLAGS="$LDFLAGS -fopenmp" -output sph_neighbor_search_mex -outdir build mex/sph_neighbor_search_mex.c
-mex -R2018a -O CFLAGS="$CFLAGS -fopenmp" LDFLAGS="$LDFLAGS -fopenmp" -output sph_physics_mex -outdir build mex/sph_physics_mex.c
+mex -R2018a -O CFLAGS="$CFLAGS -fopenmp" LDFLAGS="$LDFLAGS -fopenmp" -output sph_physics_shell_mex -outdir build mex/sph_physics_mex.c
 ```
 
 **注意：**
-- MEX 编译失败时程序自动回退到 MATLAB 实现（性能较慢但功能完整）
 - C 源文件位于 `mex/` 目录，编译产物存放在 `build/` 目录
+- `mex/sph_physics_mex.c` 现在同时提供底层 mode 和高层门面 mode：`advance_shell_step`、`wall_shear_monitor`
 
 ### 参数配置
 
@@ -127,17 +128,24 @@ mex -R2018a -O CFLAGS="$CFLAGS -fopenmp" LDFLAGS="$LDFLAGS -fopenmp" -output sph
 
 ### 环境变量控制
 
-当前版本未启用额外的环境变量覆盖接口。若需调整仿真终止时间或其他参数，请直接修改 `config.ini`，然后使用 `matlab -batch "run('SPH_Poiseuille.m')"` 运行。
+默认运行仍直接读取项目根目录下的 `config.ini` 并输出到默认结果文件。为测试或批处理隔离目录，主脚本支持以下可选环境变量覆盖：
+
+- `SPH_CONFIG_OVERRIDE`
+- `SPH_RESTART_PATH_OVERRIDE`
+- `SPH_RESULT_PNG_OVERRIDE`
+- `SPH_PROFILE_PNG_OVERRIDE`
+
+不设置这些环境变量时，行为与原先保持一致。
 
 ## 文件说明
 
 | 文件/目录 | 说明 |
 |------|------|
-| `SPH_Poiseuille.m` | 主程序，包含单层 shell 壁面与唯一 no-slip 的 SPH 模拟流程 |
+| `SPH_Poiseuille.m` | 单主文件 MATLAB 壳层，负责配置、初始化、主循环框架、监控与后处理 |
 | `build_shell_wall_particles.m` | 单层 shell 壁面粒子几何生成函数 |
 | `config.ini` | 参数配置文件（物理参数 + 仿真控制） |
 | `mex/sph_neighbor_search_mex.c` | 邻居搜索 MEX（C+OpenMP）：Cell-Linked List + 周期性边界 |
-| `mex/sph_physics_mex.c` | 物理计算 MEX（C+OpenMP）：密度修正、粘性力、传输修正、时间积分 |
+| `mex/sph_physics_mex.c` | 物理计算 MEX（C+OpenMP）：底层物理 mode + 高层门面 `advance_shell_step` / `wall_shear_monitor` |
 | `build/` | MEX 编译输出目录（自动生成，已在 `.gitignore` 中忽略） |
 | `restart.mat` | Restart 状态文件（运行过程中自动生成，用于续算） |
 | `SPH_Poiseuille_result.png` | 模拟结果可视化 |

@@ -15,14 +15,18 @@ end
 
 build_dir = fullfile(project_dir, 'build');     % MEX 编译输出目录
 mex_dir = fullfile(project_dir, 'mex');         % MEX C 源码目录
-config_path = fullfile(project_dir, 'config.ini');
-restart_path = fullfile(project_dir, 'restart.mat');
-result_png = fullfile(project_dir, 'SPH_Poiseuille_result.png');
-profile_evolution_png = fullfile(project_dir, 'SPH_centerline_profile_evolution.png');
+config_path = get_env_override('SPH_CONFIG_OVERRIDE', fullfile(project_dir, 'config.ini'));
+restart_path = get_env_override('SPH_RESTART_PATH_OVERRIDE', fullfile(project_dir, 'restart.mat'));
+result_png = get_env_override('SPH_RESULT_PNG_OVERRIDE', fullfile(project_dir, 'SPH_Poiseuille_result.png'));
+profile_evolution_png = get_env_override('SPH_PROFILE_PNG_OVERRIDE', ...
+    fullfile(project_dir, 'SPH_centerline_profile_evolution.png'));
 
 if ~exist(build_dir, 'dir')
     mkdir(build_dir);
 end
+ensure_parent_dir(restart_path);
+ensure_parent_dir(result_png);
+ensure_parent_dir(profile_evolution_png);
 addpath(build_dir);
 
 %% S1: MEX 自动编译
@@ -160,164 +164,144 @@ end
 p(1:n_fluid) = p0 * (rho(1:n_fluid) ./ rho0 - 1.0);
 p(n_fluid+1:end) = 0.0;
 
-% 壁面切应力目标值（用于监控与验证）
-tau_target = gravity_g * rho0 * DH / 2;  % 泊肃叶流壁面切应力解析值 [Pa]
-tau_num_bottom = 0.0;   % 监控变量初始化
-tau_num_top    = 0.0;
+cfg = struct( ...
+    'DL', DL, ...
+    'DH', DH, ...
+    'dp', dp, ...
+    'rho0', rho0, ...
+    'mu', mu, ...
+    'U_bulk', U_bulk, ...
+    'c_f', c_f, ...
+    't_end', t_end, ...
+    'output_interval', output_interval, ...
+    'sort_interval', sort_interval, ...
+    'restart_from_file', restart_from_file, ...
+    'gravity_g', gravity_g, ...
+    'U_max', U_max, ...
+    'h', h, ...
+    'wall_thickness', wall_thickness, ...
+    'periodic_buffer', periodic_buffer, ...
+    'p0', p0, ...
+    'inv_sigma0', inv_sigma0, ...
+    'nu', nu, ...
+    'config_signature', config_signature);
 
-% 槽道中间截面（x=DL/2）速度剖面演化记录：每个输出时刻保留一条 u(y)
-n_bins = max(20, round(DH / dp));
-mid_x = 0.5 * DL;
-mid_half_width = max(dp, h);
-profile_times = zeros(0, 1);
-mid_profile_u = NaN(n_bins, 0);
+geom = struct( ...
+    'n_fluid', n_fluid, ...
+    'n_wall', n_wall, ...
+    'n_total', n_total, ...
+    'mass', mass, ...
+    'wall_vel', wall_vel, ...
+    'wall_measure', wall_measure, ...
+    'wall_thickness_arr', wall_thickness_arr);
+
+state = struct( ...
+    'pos', pos, ...
+    'vel', vel, ...
+    'rho', rho, ...
+    'p', p, ...
+    'drho_dt', drho_dt, ...
+    'force', force, ...
+    'force_prior', force_prior, ...
+    'Vol', Vol, ...
+    'B', B, ...
+    't', t, ...
+    'step', step);
+
+neighbor = struct( ...
+    'pair_i', pair_i, ...
+    'pair_j', pair_j, ...
+    'dx_ij', dx_ij, ...
+    'dy_ij', dy_ij, ...
+    'r_ij', r_ij, ...
+    'W_ij', W_ij, ...
+    'dW_ij', dW_ij);
+
+monitor = struct( ...
+    'tau_target', gravity_g * rho0 * DH / 2, ...
+    'tau_num_bottom', 0.0, ...
+    'tau_num_top', 0.0, ...
+    'n_bins', max(20, round(DH / dp)), ...
+    'mid_x', 0.5 * DL, ...
+    'mid_half_width', max(dp, h), ...
+    'profile_times', zeros(0, 1), ...
+    'mid_profile_u', NaN(max(20, round(DH / dp)), 0));
+
 [~, u_mid_init] = compute_mid_channel_profile( ...
-    pos(1:n_fluid, :), vel(1:n_fluid, 1), DL, DH, mid_x, mid_half_width, n_bins);
-profile_times(end + 1, 1) = t;
-mid_profile_u(:, end + 1) = u_mid_init;
+    state.pos(1:geom.n_fluid, :), state.vel(1:geom.n_fluid, 1), ...
+    cfg.DL, cfg.DH, monitor.mid_x, monitor.mid_half_width, monitor.n_bins);
+monitor.profile_times(end + 1, 1) = state.t;
+monitor.mid_profile_u(:, end + 1) = u_mid_init;
 
 %% S6: 主循环（单层 CFL 时间步进）
 % 每一步使用统一时间步 dt_step，依次完成力计算、传输修正和两阶段积分。
-while t < t_end - 1e-12
-    target_time = min(t + output_interval, t_end);
+while state.t < cfg.t_end - 1e-12
+    target_time = min(state.t + cfg.output_interval, cfg.t_end);
 
-    while t < target_time - 1e-12
-        step = step + 1;
+    while state.t < target_time - 1e-12
+        state.step = state.step + 1;
 
-        % 统一 CFL 时间步长（基于人工声速 + 粒子速度）
-        dt_step = cfl_time_step(vel(1:n_fluid, :), c_f, h, target_time - t);
-        dt_step = min(dt_step, t_end - t);
+        dt_step = cfl_time_step(state.vel(1:geom.n_fluid, :), cfg.c_f, cfg.h, target_time - state.t);
+        dt_step = min(dt_step, cfg.t_end - state.t);
         if dt_step < 1e-14
-            error('时间步长退化为零（dt=%.2e），仿真在 t=%.6f step=%d 发散，请检查 shell 壁面设置。', dt_step, t, step);
+            error('时间步长退化为零（dt=%.2e），仿真在 t=%.6f step=%d 发散，请检查 shell 壁面设置。', ...
+                dt_step, state.t, state.step);
         end
 
-        % 密度重初始化 + 核梯度修正
-        [rho, Vol, B] = feval(physics_mex_name, 'density_correction', ...
-            pair_i, pair_j, dx_ij, dy_ij, r_ij, W_ij, dW_ij, ...
-            mass, n_fluid, n_total, rho0, h, inv_sigma0);
+        vel_before_step = state.vel;
+        state = advance_one_step_mex(state, geom, neighbor, cfg, dt_step, physics_mex_name);
+        [monitor.tau_num_bottom, monitor.tau_num_top] = wall_shear_monitor_mex( ...
+            neighbor, state.pos, vel_before_step, geom.wall_vel, state.Vol, state.B, ...
+            geom.n_fluid, cfg.DL, cfg.DH, cfg.mu, cfg.h, physics_mex_name);
 
-        % shell 壁面的唯一 no-slip 粘性接触
-        wall_vel(n_fluid+1:end, :) = 0;
-        viscous_force = feval(physics_mex_name, 'viscous_force', ...
-            pair_i, pair_j, dx_ij, dy_ij, r_ij, dW_ij, ...
-            vel, Vol, B, mu, h, n_fluid, n_total, mass, wall_vel);
-        force_prior = viscous_force;
-        force_prior(1:n_fluid, 1) = force_prior(1:n_fluid, 1) + mass(1:n_fluid) * gravity_g;  % 叠加体积力
-
-        % pair-wise 统计壁面剪应力，仅用于日志与验证
-        is_bottom = (pair_j > n_fluid) & (pos(pair_j, 2) < 0);
-        i_b = pair_i(is_bottom);
-        j_b = pair_j(is_bottom);
-        if ~isempty(i_b)
-            dx_b = dx_ij(is_bottom);  dy_b = dy_ij(is_bottom);
-            r_b  = r_ij(is_bottom);   dW_b  = dW_ij(is_bottom);
-            ex_b = dx_b ./ r_b;  ey_b = dy_b ./ r_b;
-            eBe_b = ex_b.*(B(i_b,1).*ex_b + B(i_b,2).*ey_b) + ...
-                    ey_b.*(B(i_b,3).*ex_b + B(i_b,4).*ey_b);
-            dv_x_b = vel(i_b,1) - wall_vel(j_b,1);
-            f_pair_b = 4*mu .* eBe_b .* dW_b .* Vol(j_b) .* dv_x_b ...
-                       ./ (r_b + 0.01*h) .* Vol(i_b);
-            tau_num_bottom = -sum(f_pair_b) / DL;
-        else
-            tau_num_bottom = 0.0;
-        end
-        is_top = (pair_j > n_fluid) & (pos(pair_j, 2) > DH);
-        i_t = pair_i(is_top);
-        j_t = pair_j(is_top);
-        if ~isempty(i_t)
-            dx_t = dx_ij(is_top);  dy_t = dy_ij(is_top);
-            r_t  = r_ij(is_top);   dW_t  = dW_ij(is_top);
-            ex_t = dx_t ./ r_t;  ey_t = dy_t ./ r_t;
-            eBe_t = ex_t.*(B(i_t,1).*ex_t + B(i_t,2).*ey_t) + ...
-                    ey_t.*(B(i_t,3).*ex_t + B(i_t,4).*ey_t);
-            dv_x_t = vel(i_t,1) - wall_vel(j_t,1);
-            f_pair_t = 4*mu .* eBe_t .* dW_t .* Vol(j_t) .* dv_x_t ...
-                       ./ (r_t + 0.01*h) .* Vol(i_t);
-            tau_num_top = -sum(f_pair_t) / DL;
-        else
-            tau_num_top = 0.0;
-        end
-
-        % 传输速度修正（抑制张力不稳定性）
-        pos = feval(physics_mex_name, 'transport_correction', ...
-            pair_i, pair_j, dx_ij, dy_ij, r_ij, dW_ij, ...
-            Vol, B, pos, h, n_fluid, n_total);
-
-        pos = bounding_from_wall(pos, n_fluid, DH, dp);
-
-        % 第一阶段积分：密度演化 + 压力更新 + 位置半步推进 + 压力梯度力
-        [rho, p, pos, force, drho_dt] = feval(physics_mex_name, 'integration_1st', ...
-            pair_i, pair_j, dx_ij, dy_ij, r_ij, dW_ij, ...
-            Vol, B, rho, mass, pos, vel, drho_dt, force_prior, dt_step, ...
-            n_fluid, n_total, rho0, p0, c_f, wall_vel);
-
-        % 速度更新：合力（粘性力 + 压力梯度力）/ 质量 * dt_step
-        acc_fluid = (force_prior(1:n_fluid, :) + force(1:n_fluid, :)) ./ mass(1:n_fluid);
-        vel(1:n_fluid, :) = vel(1:n_fluid, :) + acc_fluid * dt_step;
-
-        % 第二阶段积分：位置修正 + 密度散度修正
-        [pos, drho_dt, ~] = feval(physics_mex_name, 'integration_2nd', ...
-            pair_i, pair_j, dx_ij, dy_ij, r_ij, dW_ij, ...
-            Vol, rho, pos, vel, dt_step, n_fluid, n_total, wall_vel);
-        rho(1:n_fluid) = rho(1:n_fluid) + drho_dt(1:n_fluid) * (dt_step / 2.0);  % 密度半步修正
-
-        % X 方向周期性边界处理
-        [pos, wrapped] = periodic_bounding(pos, n_fluid, DL, periodic_buffer);
+        [state.pos, wrapped] = periodic_bounding(state.pos, geom.n_fluid, cfg.DL, cfg.periodic_buffer);
         if wrapped
-            [pair_i, pair_j, dx_ij, dy_ij, r_ij, W_ij, dW_ij] = feval(neighbor_mex_name, pos, n_fluid, n_total, h, DL);
+            neighbor = build_neighbor_cache(state.pos, geom.n_fluid, geom.n_total, cfg.h, cfg.DL, neighbor_mex_name);
         end
 
-        % 单步推进结束：周期性边界 + 壁面防穿透
-        [pos, ~] = periodic_bounding(pos, n_fluid, DL, periodic_buffer);
-        pos = bounding_from_wall(pos, n_fluid, DH, dp);
-        vel(n_fluid+1:end, :) = zeros(n_wall, 2);
+        [state.pos, ~] = periodic_bounding(state.pos, geom.n_fluid, cfg.DL, cfg.periodic_buffer);
+        state.pos = bounding_from_wall(state.pos, geom.n_fluid, cfg.DH, cfg.dp);
+        state.vel(geom.n_fluid+1:end, :) = 0.0;
 
-        % 定期按空间网格排序粒子（提升缓存命中率）
-        if mod(step, sort_interval) == 0 && step ~= 1
-            [pos, vel, rho, mass, wall_vel, drho_dt, force_prior, force, p, Vol, B] = sort_particles_by_cell( ...
-                pos, vel, rho, mass, wall_vel, drho_dt, force_prior, force, p, Vol, B, n_fluid, DL, h);
+        if mod(state.step, cfg.sort_interval) == 0 && state.step ~= 1
+            [state.pos, state.vel, state.rho, geom.mass, geom.wall_vel, state.drho_dt, ...
+                state.force_prior, state.force, state.p, state.Vol, state.B] = sort_particles_by_cell( ...
+                state.pos, state.vel, state.rho, geom.mass, geom.wall_vel, state.drho_dt, ...
+                state.force_prior, state.force, state.p, state.Vol, state.B, ...
+                geom.n_fluid, cfg.DL, cfg.h);
         end
-        [pair_i, pair_j, dx_ij, dy_ij, r_ij, W_ij, dW_ij] = feval(neighbor_mex_name, pos, n_fluid, n_total, h, DL);
+        neighbor = build_neighbor_cache(state.pos, geom.n_fluid, geom.n_total, cfg.h, cfg.DL, neighbor_mex_name);
 
-        t = t + dt_step;
+        state.t = state.t + dt_step;
 
-        if mod(step, 20) == 0
-            vmax = max(vecnorm(vel(1:n_fluid, :), 2, 2));
+        if mod(state.step, 20) == 0
+            vmax = max(vecnorm(state.vel(1:geom.n_fluid, :), 2, 2));
             fprintf('step=%d, t=%.6f/%.6f, dt=%.4e, pairs=%d, vmax=%.4f\n', ...
-                step, t, t_end, dt_step, numel(pair_i), vmax);
+                state.step, state.t, cfg.t_end, dt_step, numel(neighbor.pair_i), vmax);
             fprintf('  [shell-noslip] tau_bot=%.4f, tau_top=%.4f, tau_target=%.4f\n', ...
-                tau_num_bottom, tau_num_top, tau_target);
+                monitor.tau_num_bottom, monitor.tau_num_top, monitor.tau_target);
         end
     end
 
-    fprintf('输出点: t=%.6f, step=%d\n', t, step);
-    state = struct( ...
-        'pos', pos, ...
-        'vel', vel, ...
-        'rho', rho, ...
-        'p', p, ...
-        'drho_dt', drho_dt, ...
-        'force', force, ...
-        'force_prior', force_prior, ...
-        't', t, ...
-        'step', step);
-    save_restart(restart_path, config_signature, state);
+    fprintf('输出点: t=%.6f, step=%d\n', state.t, state.step);
+    save_restart(restart_path, cfg.config_signature, make_restart_state(state));
 
     [~, u_mid_now] = compute_mid_channel_profile( ...
-        pos(1:n_fluid, :), vel(1:n_fluid, 1), DL, DH, mid_x, mid_half_width, n_bins);
-    profile_times(end + 1, 1) = t;
-    mid_profile_u(:, end + 1) = u_mid_now;
+        state.pos(1:geom.n_fluid, :), state.vel(1:geom.n_fluid, 1), ...
+        cfg.DL, cfg.DH, monitor.mid_x, monitor.mid_half_width, monitor.n_bins);
+    monitor.profile_times(end + 1, 1) = state.t;
+    monitor.mid_profile_u(:, end + 1) = u_mid_now;
 end
 
 %% S7: 后处理与验证
 % 提取流体粒子速度剖面，与泊肃叶流解析解对比
-fluid_pos = pos(1:n_fluid, :);
-fluid_pos(:, 1) = mod(fluid_pos(:, 1), DL);
-fluid_vel = vel(1:n_fluid, :);
+fluid_pos = state.pos(1:geom.n_fluid, :);
+fluid_pos(:, 1) = mod(fluid_pos(:, 1), cfg.DL);
+fluid_vel = state.vel(1:geom.n_fluid, :);
 
-[y_mid, u_mean] = compute_binned_profile_mean(fluid_pos(:, 2), fluid_vel(:, 1), 0.0, DH, n_bins);
+[y_mid, u_mean] = compute_binned_profile_mean(fluid_pos(:, 2), fluid_vel(:, 1), 0.0, cfg.DH, monitor.n_bins);
 % 无滑移 BC 下解析解：标准抛物线
-u_exact = gravity_g / (2.0 * nu) .* y_mid .* (DH - y_mid);
+u_exact = cfg.gravity_g / (2.0 * cfg.nu) .* y_mid .* (cfg.DH - y_mid);
 
 valid = ~isnan(u_mean);
 if ~any(valid)
@@ -337,9 +321,9 @@ fig = figure('Color', 'w', 'Position', [100, 100, 1400, 520], 'Renderer', 'paint
 
 % --- 左图：速度剖面对比 ---
 ax1 = subplot(1, 2, 1);
-y_norm = y_mid / DH;
-u_norm_exact = u_exact / U_max;
-u_norm_sph   = u_mean  / U_max;
+y_norm = y_mid / cfg.DH;
+u_norm_exact = u_exact / cfg.U_max;
+u_norm_sph   = u_mean  / cfg.U_max;
 
 plot(ax1, u_norm_exact, y_norm, '-', 'Color', [0.1 0.1 0.1], 'LineWidth', 1.8); hold(ax1, 'on');
 plot(ax1, u_norm_sph, y_norm, 'o', 'Color', [0.85 0.2 0.2], ...
@@ -365,67 +349,67 @@ title(ax1, '(a) Velocity profile', 'FontName', 'Times New Roman', ...
 ax2 = subplot(1, 2, 2);
 
 % 构建规则网格，分辨率与粒子间距匹配
-nx_grid = round(DL / dp) * 2;
-ny_grid = round(DH / dp) * 2;
-xg = linspace(0, DL, nx_grid);
-yg = linspace(0, DH, ny_grid);
+nx_grid = round(cfg.DL / cfg.dp) * 2;
+ny_grid = round(cfg.DH / cfg.dp) * 2;
+xg = linspace(0, cfg.DL, nx_grid);
+yg = linspace(0, cfg.DH, ny_grid);
 [Xg, Yg] = meshgrid(xg, yg);
 
 % 将周期性流体粒子位置展开，补 ghost 粒子处理周期边界
-fp_x = mod(fluid_pos(:,1), DL);
+fp_x = mod(fluid_pos(:,1), cfg.DL);
 fp_y = fluid_pos(:,2);
 fv_x = fluid_vel(:,1);
 % 左侧 ghost：把右侧粒子（x > DL - 2h）复制到 x - DL
-right_mask = fp_x > DL - 2*h;
+right_mask = fp_x > cfg.DL - 2*cfg.h;
 % 右侧 ghost：把左侧粒子（x < 2h）复制到 x + DL
-left_mask  = fp_x < 2*h;
-fp_x_ext = [fp_x; fp_x(right_mask) - DL; fp_x(left_mask) + DL];
+left_mask  = fp_x < 2*cfg.h;
+fp_x_ext = [fp_x; fp_x(right_mask) - cfg.DL; fp_x(left_mask) + cfg.DL];
 fp_y_ext = [fp_y; fp_y(right_mask);       fp_y(left_mask)];
 fv_x_ext = [fv_x; fv_x(right_mask);      fv_x(left_mask)];
 F_interp = scatteredInterpolant(fp_x_ext, fp_y_ext, fv_x_ext, 'natural', 'nearest');
 Ug = F_interp(Xg, Yg);
 
 % shell 壁面显示厚度
-wall_thick = wall_thickness;
+wall_thick = cfg.wall_thickness;
 y_lo = -wall_thick;
-y_hi = DH + wall_thick;
+y_hi = cfg.DH + wall_thick;
 
 % 绘制下壁面灰色区域
-fill(ax2, [0 DL DL 0], [y_lo y_lo 0 0], [0.75 0.75 0.75], ...
+fill(ax2, [0 cfg.DL cfg.DL 0], [y_lo y_lo 0 0], [0.75 0.75 0.75], ...
     'EdgeColor', 'none'); hold(ax2, 'on');
 % 绘制上壁面灰色区域
-fill(ax2, [0 DL DL 0], [DH DH y_hi y_hi], [0.75 0.75 0.75], ...
+fill(ax2, [0 cfg.DL cfg.DL 0], [cfg.DH cfg.DH y_hi y_hi], [0.75 0.75 0.75], ...
     'EdgeColor', 'none');
 % 壁面边界线
-plot(ax2, [0 DL], [0 0], 'k-', 'LineWidth', 1.2);
-plot(ax2, [0 DL], [DH DH], 'k-', 'LineWidth', 1.2);
+plot(ax2, [0 cfg.DL], [0 0], 'k-', 'LineWidth', 1.2);
+plot(ax2, [0 cfg.DL], [cfg.DH cfg.DH], 'k-', 'LineWidth', 1.2);
 
 % 流体速度场
 imagesc(ax2, xg, yg, Ug);
 set(ax2, 'YDir', 'normal');
 
 % 重绘壁面（imagesc 会覆盖 fill）
-fill(ax2, [0 DL DL 0], [y_lo y_lo 0 0], [0.75 0.75 0.75], 'EdgeColor', 'none');
-fill(ax2, [0 DL DL 0], [DH DH y_hi y_hi], [0.75 0.75 0.75], 'EdgeColor', 'none');
-plot(ax2, [0 DL], [0 0], 'k-', 'LineWidth', 1.2);
-plot(ax2, [0 DL], [DH DH], 'k-', 'LineWidth', 1.2);
+fill(ax2, [0 cfg.DL cfg.DL 0], [y_lo y_lo 0 0], [0.75 0.75 0.75], 'EdgeColor', 'none');
+fill(ax2, [0 cfg.DL cfg.DL 0], [cfg.DH cfg.DH y_hi y_hi], [0.75 0.75 0.75], 'EdgeColor', 'none');
+plot(ax2, [0 cfg.DL], [0 0], 'k-', 'LineWidth', 1.2);
+plot(ax2, [0 cfg.DL], [cfg.DH cfg.DH], 'k-', 'LineWidth', 1.2);
 
 % 壁面标注
-text(ax2, DL/2, y_lo/2, 'Wall', 'HorizontalAlignment', 'center', ...
+text(ax2, cfg.DL/2, y_lo/2, 'Wall', 'HorizontalAlignment', 'center', ...
     'FontName', 'Times New Roman', 'FontSize', 11, 'Color', [0.3 0.3 0.3]);
-text(ax2, DL/2, DH + wall_thick/2, 'Wall', 'HorizontalAlignment', 'center', ...
+text(ax2, cfg.DL/2, cfg.DH + wall_thick/2, 'Wall', 'HorizontalAlignment', 'center', ...
     'FontName', 'Times New Roman', 'FontSize', 11, 'Color', [0.3 0.3 0.3]);
 hold(ax2, 'off');
 
 axis(ax2, 'equal');
-xlim(ax2, [0, DL]);
+xlim(ax2, [0, cfg.DL]);
 ylim(ax2, [y_lo, y_hi]);
 set(ax2, 'FontName', 'Times New Roman', 'FontSize', 13, 'LineWidth', 1.0, ...
     'TickDir', 'in', 'TickLength', [0.015 0.015], 'Box', 'on');
 xlabel(ax2, '$x$ (m)', 'Interpreter', 'latex', 'FontSize', 14);
 ylabel(ax2, '$y$ (m)', 'Interpreter', 'latex', 'FontSize', 14);
 colormap(ax2, turbo);
-caxis(ax2, [0, U_max * 1.1]);
+caxis(ax2, [0, cfg.U_max * 1.1]);
 cb = colorbar(ax2);
 cb.Label.String = '$u_x$ (m/s)';
 cb.Label.Interpreter = 'latex';
@@ -443,15 +427,15 @@ fig_evo = figure('Color', 'w', 'Position', [140, 140, 760, 560], 'Renderer', 'pa
 ax_evo = axes(fig_evo);
 hold(ax_evo, 'on');
 
-tvals = profile_times(:)';
+tvals = monitor.profile_times(:)';
 n_profiles = numel(tvals);
 line_cmap = parula(max(n_profiles, 2));
 
 for k = 1:n_profiles
-    u_k = mid_profile_u(:, k) / U_max;
+    u_k = monitor.mid_profile_u(:, k) / cfg.U_max;
     valid_k = ~isnan(u_k);
     if any(valid_k)
-        plot(ax_evo, u_k(valid_k), y_mid(valid_k) / DH, '-', ...
+        plot(ax_evo, u_k(valid_k), y_mid(valid_k) / cfg.DH, '-', ...
             'Color', line_cmap(k, :), 'LineWidth', 1.0);
     end
 end
@@ -521,6 +505,61 @@ function ensure_mex_compiled(src_path, out_name, build_dir)
     if ~exist(out_bin, 'file')
         error('编译后未生成: %s', out_bin);
     end
+end
+
+function value = get_env_override(env_name, default_value)
+    value = getenv(env_name);
+    if isempty(value)
+        value = default_value;
+    end
+end
+
+function ensure_parent_dir(file_path)
+    parent_dir = fileparts(file_path);
+    if ~isempty(parent_dir) && ~exist(parent_dir, 'dir')
+        mkdir(parent_dir);
+    end
+end
+
+function neighbor = build_neighbor_cache(pos, n_fluid, n_total, h, DL, neighbor_mex_name)
+    [pair_i, pair_j, dx_ij, dy_ij, r_ij, W_ij, dW_ij] = feval( ...
+        neighbor_mex_name, pos, n_fluid, n_total, h, DL);
+    neighbor = struct( ...
+        'pair_i', pair_i, ...
+        'pair_j', pair_j, ...
+        'dx_ij', dx_ij, ...
+        'dy_ij', dy_ij, ...
+        'r_ij', r_ij, ...
+        'W_ij', W_ij, ...
+        'dW_ij', dW_ij);
+end
+
+function state = advance_one_step_mex(state, geom, neighbor, cfg, dt_step, physics_mex_name)
+    [state.rho, state.p, state.pos, state.vel, state.drho_dt, state.force, state.force_prior, state.Vol, state.B] = feval( ...
+        physics_mex_name, 'advance_shell_step', ...
+        neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.W_ij, neighbor.dW_ij, ...
+        geom.mass, state.pos, state.vel, geom.wall_vel, state.rho, state.drho_dt, ...
+        dt_step, geom.n_fluid, geom.n_total, cfg.rho0, cfg.p0, cfg.c_f, cfg.mu, cfg.h, cfg.inv_sigma0, cfg.gravity_g);
+end
+
+function [tau_bottom, tau_top] = wall_shear_monitor_mex(neighbor, pos, vel, wall_vel, Vol, B, n_fluid, DL, DH, mu, h, physics_mex_name)
+    [tau_bottom, tau_top] = feval( ...
+        physics_mex_name, 'wall_shear_monitor', ...
+        neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.dW_ij, ...
+        pos, vel, wall_vel, Vol, B, n_fluid, DL, DH, mu, h);
+end
+
+function restart_state = make_restart_state(state)
+    restart_state = struct( ...
+        'pos', state.pos, ...
+        'vel', state.vel, ...
+        'rho', state.rho, ...
+        'p', state.p, ...
+        'drho_dt', state.drho_dt, ...
+        'force', state.force, ...
+        'force_prior', state.force_prior, ...
+        't', state.t, ...
+        'step', state.step);
 end
 
 function cfg = parse_ini(filename)
