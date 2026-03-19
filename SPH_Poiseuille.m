@@ -1,6 +1,6 @@
 %% SPH_Poiseuille.m
 % 基于 SPH（光滑粒子流体动力学）方法的二维平板泊肃叶流动模拟
-% 采用弱可压缩 SPH + 单层 CFL 时间步进
+% 采用弱可压缩 SPH + dual-criteria 时间步进
 % 计算加速：C/MEX + OpenMP（邻居搜索与物理计算分离）
 
 clear; clc; close all;
@@ -52,7 +52,7 @@ t_end = get_ini_numeric(cfg, 'simulation', 'end_time');
 output_interval = get_ini_numeric(cfg, 'simulation', 'output_interval');
 sort_interval = round(get_ini_numeric(cfg, 'simulation', 'sort_interval'));
 restart_from_file = round(get_ini_numeric(cfg, 'simulation', 'restart_from_file'));
-fprintf('边界模式: 单层 shell 壁面 + 唯一 no-slip\n');
+fprintf('边界模式: 厚壁粒子 + 算子内 no-slip / no-penetration\n');
 
 % 几何参数自动对齐：确保 DL/dp 和 DH/dp 为整数（周期边界 + 均匀粒子排列）
 DL_raw = DL;  DH_raw = DH;
@@ -66,18 +66,19 @@ end
 gravity_g = 12.0 * mu * U_bulk / (rho0 * DH^2);  % 等效体积力（驱动泊肃叶流）
 U_max = 1.5 * U_bulk;                             % 中心线最大速度（2D平板泊肃叶流解析关系）
 h = 1.3 * dp;                                   % 光滑长度
-wall_thickness = dp;                             % shell 壁面厚度
-periodic_buffer = 4.0 * dp;                      % 周期性缓冲层宽度
+wall_thickness = 4.0 * dp;                       % 厚壁宽度，对齐 SPHinXsys 的 BW = 4dp
+periodic_buffer = 0.0;                           % 周期边界立即包裹，不保留额外缓冲带
+transport_coeff = 0.1;                           % dual-criteria 下保守的 shifting 系数
 p0 = rho0 * c_f^2;                              % 参考压力（弱可压缩状态方程）
 inv_sigma0 = dp^2;                               % 核函数归一化因子的倒数
 nu = mu / rho0;                                  % 运动粘度
 
 fprintf('参数: DL=%.3f, DH=%.3f, dp=%.4f, h=%.4f\n', DL, DH, dp, h);
 fprintf('参数: rho0=%.3f, mu=%.3f, U_bulk=%.6f, c_f=%.3f\n', rho0, mu, U_bulk, c_f);
-fprintf('派生: g=%.6f, Umax=%.6f, p0=%.6f\n', gravity_g, U_max, p0);
+fprintf('派生: g=%.6f, Umax=%.6f, p0=%.6f, transport_coeff=%.3f\n', gravity_g, U_max, p0, transport_coeff);
 fprintf('仿真: end_time=%.3f, output_interval=%.3f, sort_interval=%d\n', t_end, output_interval, sort_interval);
-fprintf('周期缓冲层: buffer=%.4f (%.2f*h)\n', periodic_buffer, periodic_buffer / h);
-fprintf('壁面: 单层 shell, thickness=%.4f\n', wall_thickness);
+fprintf('周期边界: immediate wrap + minimum-image neighbor search\n');
+fprintf('壁面: 厚壁粒子区, BW=%.4f (%.0f*dp)\n', wall_thickness, wall_thickness / dp);
 
 if sort_interval <= 0
     error('sort_interval 必须为正整数。');
@@ -91,8 +92,8 @@ y_fluid = (dp/2 : dp : DH - dp/2)';
 pos_fluid = [X_fluid(:), Y_fluid(:)];
 n_fluid = size(pos_fluid, 1);
 
-% 单层 shell 壁面粒子：上下各一层中面，显式携带厚度语义
-[pos_wall, ~, wall_measure, wall_thickness_arr] = build_shell_wall_particles(DL, DH, dp, wall_thickness);
+% 厚壁粒子区：上下各 BW 厚度的规则壁面粒子层
+[pos_wall, wall_normal, wall_measure, wall_thickness_arr] = build_shell_wall_particles(DL, DH, dp, wall_thickness);
 n_wall = size(pos_wall, 1);
 n_total = n_fluid + n_wall;
 
@@ -184,6 +185,7 @@ cfg = struct( ...
     'p0', p0, ...
     'inv_sigma0', inv_sigma0, ...
     'nu', nu, ...
+    'transport_coeff', transport_coeff, ...
     'config_signature', config_signature);
 
 geom = struct( ...
@@ -192,6 +194,7 @@ geom = struct( ...
     'n_total', n_total, ...
     'mass', mass, ...
     'wall_vel', wall_vel, ...
+    'wall_normal', wall_normal, ...
     'wall_measure', wall_measure, ...
     'wall_thickness_arr', wall_thickness_arr);
 
@@ -233,34 +236,55 @@ monitor = struct( ...
 monitor.profile_times(end + 1, 1) = state.t;
 monitor.mid_profile_u(:, end + 1) = u_mid_init;
 
-%% S6: 主循环（单层 CFL 时间步进）
-% 每一步使用统一时间步 dt_step，依次完成力计算、传输修正和两阶段积分。
+%% S6: 主循环（dual-criteria 时间步进）
+% 每个外层对流/黏性步 Dt 只做一次密度求和、核修正、粘性力和传输修正，
+% 然后在 Dt 内部执行多次声学子步推进压力/密度松弛。
 while state.t < cfg.t_end - 1e-12
     target_time = min(state.t + cfg.output_interval, cfg.t_end);
 
     while state.t < target_time - 1e-12
         state.step = state.step + 1;
 
-        dt_step = cfl_time_step(state.vel(1:geom.n_fluid, :), cfg.c_f, cfg.h, target_time - state.t);
-        dt_step = min(dt_step, cfg.t_end - state.t);
-        if dt_step < 1e-14
-            error('时间步长退化为零（dt=%.2e），仿真在 t=%.6f step=%d 发散，请检查 shell 壁面设置。', ...
-                dt_step, state.t, state.step);
+        remain_outer = min(target_time - state.t, cfg.t_end - state.t);
+        Dt_outer = advection_viscous_time_step( ...
+            state.vel(1:geom.n_fluid, :), state.force(1:geom.n_fluid, :), ...
+            state.force_prior(1:geom.n_fluid, :), geom.mass(1:geom.n_fluid), ...
+            cfg.U_bulk, cfg.nu, cfg.h, remain_outer);
+        if Dt_outer < 1e-14
+            error('外层时间步退化为零（Dt=%.2e），仿真在 t=%.6f step=%d 发散。', ...
+                Dt_outer, state.t, state.step);
         end
 
-        vel_before_step = state.vel;
-        state = advance_one_step_mex(state, geom, neighbor, cfg, dt_step, physics_mex_name);
-        [monitor.tau_num_bottom, monitor.tau_num_top] = wall_shear_monitor_mex( ...
-            neighbor, state.pos, vel_before_step, geom.wall_vel, state.Vol, state.B, ...
-            geom.n_fluid, cfg.DL, cfg.DH, cfg.mu, cfg.h, physics_mex_name);
+        [state.rho, state.Vol, state.B] = density_correction_mex( ...
+            neighbor, geom.mass, geom.n_fluid, geom.n_total, cfg, physics_mex_name);
+        state.force_prior = compute_force_prior_mex(state, geom, neighbor, cfg, physics_mex_name);
+        state.pos = transport_correction_mex(state.pos, state.Vol, state.B, neighbor, geom, cfg, physics_mex_name);
 
-        [state.pos, wrapped] = periodic_bounding(state.pos, geom.n_fluid, cfg.DL, cfg.periodic_buffer);
-        if wrapped
-            neighbor = build_neighbor_cache(state.pos, geom.n_fluid, geom.n_total, cfg.h, cfg.DL, neighbor_mex_name);
+        relaxation_time = 0.0;
+        dt_inner = 0.0;
+        while relaxation_time < Dt_outer - 1e-12
+            dt_inner = cfl_time_step(state.vel(1:geom.n_fluid, :), cfg.c_f, cfg.h, Dt_outer - relaxation_time);
+            dt_inner = min(dt_inner, target_time - state.t);
+            dt_inner = min(dt_inner, cfg.t_end - state.t);
+            if dt_inner < 1e-14
+                error('声学时间步退化为零（dt=%.2e），仿真在 t=%.6f step=%d 发散。', ...
+                    dt_inner, state.t, state.step);
+            end
+
+            [state.rho, state.p, state.pos, state.force, state.drho_dt] = integration_1st_mex( ...
+                state, geom, neighbor, cfg, dt_inner, physics_mex_name);
+            state.vel = update_velocity(state.vel, geom.mass, state.force_prior, state.force, geom.n_fluid, geom.n_total, dt_inner);
+            [state.pos, state.drho_dt] = integration_2nd_mex( ...
+                state, geom, neighbor, dt_inner, physics_mex_name);
+            state.rho(1:geom.n_fluid) = state.rho(1:geom.n_fluid) + state.drho_dt(1:geom.n_fluid) * (0.5 * dt_inner);
+            state.p(1:geom.n_fluid) = cfg.p0 * (state.rho(1:geom.n_fluid) ./ cfg.rho0 - 1.0);
+            state.p(geom.n_fluid+1:end) = 0.0;
+
+            relaxation_time = relaxation_time + dt_inner;
+            state.t = state.t + dt_inner;
         end
 
         [state.pos, ~] = periodic_bounding(state.pos, geom.n_fluid, cfg.DL, cfg.periodic_buffer);
-        state.pos = bounding_from_wall(state.pos, geom.n_fluid, cfg.DH, cfg.dp);
         state.vel(geom.n_fluid+1:end, :) = 0.0;
 
         if mod(state.step, cfg.sort_interval) == 0 && state.step ~= 1
@@ -270,15 +294,17 @@ while state.t < cfg.t_end - 1e-12
                 state.force_prior, state.force, state.p, state.Vol, state.B, ...
                 geom.n_fluid, cfg.DL, cfg.h);
         end
-        neighbor = build_neighbor_cache(state.pos, geom.n_fluid, geom.n_total, cfg.h, cfg.DL, neighbor_mex_name);
 
-        state.t = state.t + dt_step;
+        neighbor = build_neighbor_cache(state.pos, geom.n_fluid, geom.n_total, cfg.h, cfg.DL, neighbor_mex_name);
+        [monitor.tau_num_bottom, monitor.tau_num_top] = wall_shear_monitor_mex( ...
+            neighbor, state.pos, state.vel, geom.wall_vel, state.Vol, state.B, ...
+            geom.n_fluid, cfg.DL, cfg.DH, cfg.mu, cfg.h, physics_mex_name);
 
         if mod(state.step, 20) == 0
             vmax = max(vecnorm(state.vel(1:geom.n_fluid, :), 2, 2));
-            fprintf('step=%d, t=%.6f/%.6f, dt=%.4e, pairs=%d, vmax=%.4f\n', ...
-                state.step, state.t, cfg.t_end, dt_step, numel(neighbor.pair_i), vmax);
-            fprintf('  [shell-noslip] tau_bot=%.4f, tau_top=%.4f, tau_target=%.4f\n', ...
+            fprintf('step=%d, t=%.6f/%.6f, Dt=%.4e, dt=%.4e, pairs=%d, vmax=%.4f\n', ...
+                state.step, state.t, cfg.t_end, Dt_outer, dt_inner, numel(neighbor.pair_i), vmax);
+            fprintf('  [thick-wall-noslip] tau_bot=%.4f, tau_top=%.4f, tau_target=%.4f\n', ...
                 monitor.tau_num_bottom, monitor.tau_num_top, monitor.tau_target);
         end
     end
@@ -534,6 +560,65 @@ function neighbor = build_neighbor_cache(pos, n_fluid, n_total, h, DL, neighbor_
         'dW_ij', dW_ij);
 end
 
+function [rho, Vol, B] = density_correction_mex(neighbor, mass, n_fluid, n_total, cfg, physics_mex_name)
+    [rho, Vol, B] = feval( ...
+        physics_mex_name, 'density_correction', ...
+        neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.W_ij, neighbor.dW_ij, ...
+        mass, n_fluid, n_total, cfg.rho0, cfg.h, cfg.inv_sigma0);
+end
+
+function force_prior = compute_force_prior_mex(state, geom, neighbor, cfg, physics_mex_name)
+    force_prior = feval( ...
+        physics_mex_name, 'viscous_force', ...
+        neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.dW_ij, ...
+        state.vel, state.Vol, state.B, cfg.mu, cfg.h, geom.n_fluid, geom.n_total, geom.mass, geom.wall_vel);
+    force_prior(1:geom.n_fluid, 1) = force_prior(1:geom.n_fluid, 1) + geom.mass(1:geom.n_fluid) * cfg.gravity_g;
+    force_prior(geom.n_fluid+1:end, :) = 0.0;
+end
+
+function pos = transport_correction_mex(pos, Vol, B, neighbor, geom, cfg, physics_mex_name)
+    pos = feval( ...
+        physics_mex_name, 'transport_correction', ...
+        neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.dW_ij, ...
+        Vol, B, pos, cfg.h, geom.n_fluid, geom.n_total, cfg.transport_coeff);
+end
+
+function [rho, p, pos, force, drho_dt] = integration_1st_mex(state, geom, neighbor, cfg, dt_step, physics_mex_name)
+    [rho, p, pos, force, drho_dt] = feval( ...
+        physics_mex_name, 'integration_1st', ...
+        neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.dW_ij, ...
+        state.Vol, state.B, state.rho, geom.mass, state.pos, state.vel, state.drho_dt, state.force_prior, ...
+        dt_step, geom.n_fluid, geom.n_total, cfg.rho0, cfg.p0, cfg.c_f, geom.wall_vel);
+end
+
+function vel = update_velocity(vel, mass, force_prior, force, n_fluid, n_total, dt_step)
+    acc_fluid = (force_prior(1:n_fluid, :) + force(1:n_fluid, :)) ./ mass(1:n_fluid);
+    vel(1:n_fluid, :) = vel(1:n_fluid, :) + acc_fluid * dt_step;
+    vel(n_fluid+1:n_total, :) = 0.0;
+end
+
+function [pos, drho_dt] = integration_2nd_mex(state, geom, neighbor, dt_step, physics_mex_name)
+    [pos, drho_dt, ~] = feval( ...
+        physics_mex_name, 'integration_2nd', ...
+        neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.dW_ij, ...
+        state.Vol, state.rho, state.pos, state.vel, dt_step, geom.n_fluid, geom.n_total, geom.wall_vel);
+end
+
+function Dt = advection_viscous_time_step(vel, force, force_prior, mass, U_ref, nu, h, remain)
+% Dual-criteria 外层时间步：对流/黏性尺度控制一次配置更新的间隔
+    accel_norm = vecnorm(force + force_prior, 2, 2);
+    accel_scale = 4.0 * h * accel_norm ./ max(mass, eps);
+    speed_sq = vecnorm(vel, 2, 2) .^ 2;
+    speed_max = sqrt(max([speed_sq; accel_scale; 0.0]));
+    speed_ref = max(U_ref, nu / max(h, eps));
+    Dt = min(0.25 * h / max(max(speed_max, speed_ref), 1e-12), remain);
+    Dt = max(Dt, 1e-12);
+end
+
+function sink = void_buffer(~)
+    sink = [];
+end
+
 function state = advance_one_step_mex(state, geom, neighbor, cfg, dt_step, physics_mex_name)
     [state.rho, state.p, state.pos, state.vel, state.drho_dt, state.force, state.force_prior, state.Vol, state.B] = feval( ...
         physics_mex_name, 'advance_shell_step', ...
@@ -630,7 +715,7 @@ function value = get_ini_numeric(cfg, section, key)
 end
 
 function sig = create_config_signature(DL, DH, dp, rho0, mu, U_bulk, c_f, t_end, output_interval, sort_interval)
-    sig = sprintf('DL=%.12g|DH=%.12g|dp=%.12g|rho0=%.12g|mu=%.12g|Ub=%.12g|cf=%.12g|t=%.12g|oi=%.12g|si=%d|wall=single-shell-noslip', ...
+    sig = sprintf('DL=%.12g|DH=%.12g|dp=%.12g|rho0=%.12g|mu=%.12g|Ub=%.12g|cf=%.12g|t=%.12g|oi=%.12g|si=%d|wall=thick-wall-noslip-dual-dt', ...
         DL, DH, dp, rho0, mu, U_bulk, c_f, t_end, output_interval, sort_interval);
 end
 
@@ -685,22 +770,12 @@ function idx = sort_subset_indices(pos_sub, DL, h)
 end
 
 function [pos, wrapped] = periodic_bounding(pos, n_fluid, DL, buffer_width)
-% X 方向周期性边界：超出 [−buffer, DL+buffer] 的粒子平移回域内
+% X 方向周期性边界：粒子越界后立即包裹回 [0, DL)
     x = pos(1:n_fluid, 1);
-    wrapped = false;
-    left_mask = (x < -buffer_width);
-    while any(left_mask)
-        x(left_mask) = x(left_mask) + DL;
-        wrapped = true;
-        left_mask = (x < -buffer_width);
-    end
-    right_mask = (x >= DL + buffer_width);
-    while any(right_mask)
-        x(right_mask) = x(right_mask) - DL;
-        wrapped = true;
-        right_mask = (x >= DL + buffer_width);
-    end
-    pos(1:n_fluid, 1) = x;
+    x_wrapped = mod(x, DL);
+    wrapped = any(abs(x_wrapped - x) > 1e-12);
+    pos(1:n_fluid, 1) = x_wrapped;
+    void_buffer(buffer_width);
 end
 
 function [y_mid, u_mean] = compute_binned_profile_mean(y_values, u_values, y_min, y_max, n_bins)

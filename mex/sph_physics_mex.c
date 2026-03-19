@@ -546,11 +546,12 @@ static void mode_viscous_force(int nlhs, mxArray *plhs[], int nrhs, const mxArra
  *   流体-壁面对：inc_i += -2 * dW * Vol_j * B_i·e（单侧，系数 2 来自镜像对称）
  *
  * 限幅：limiter = clamp(100 * |inc|² / h², 0, 1)
- *   pos_i += 0.2 * h² * limiter * inc_i
+ *   pos_i += transport_coeff * h² * limiter * inc_i
  *
- * 输入（prhs[1..12]）：
+ * 输入（prhs[1..12] 或 prhs[1..13]）：
  *   pair_i, pair_j, dx, dy, r, dW  — 粒子对数据
  *   Vol[n_total], B[n_total×4], pos[n_total×2], h, n_fluid, n_total
+ *   transport_coeff（可选，默认 0.2）
  * 输出（plhs[0]）：pos[n_total×2]（修正后位置）
  */
 static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
@@ -568,6 +569,7 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
     int n_fluid;
     int n_total;
     double h;
+    double transport_coeff = 0.2;
     const double *pos_x;
     const double *pos_y;
     double *pos_out;
@@ -577,8 +579,8 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
     double *inc_y;
     int k;  /* Changed from mwSize to int for OpenMP compatibility */
 
-    require_count(nrhs == 13, "SPH:Physics:transport:nrhs",
-                  "transport_correction expects 13 inputs after mode.");
+    require_count(nrhs == 13 || nrhs == 14, "SPH:Physics:transport:nrhs",
+                  "transport_correction expects 12 or 13 inputs after mode.");
     require_count(nlhs == 1, "SPH:Physics:transport:nlhs",
                   "transport_correction expects 1 output.");
 
@@ -590,6 +592,11 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
     h = mxGetScalar(prhs[10]);
     n_fluid = (int)mxGetScalar(prhs[11]);
     n_total = (int)mxGetScalar(prhs[12]);
+    if (nrhs == 14) {
+        transport_coeff = mxGetScalar(prhs[13]);
+    }
+    require_count(transport_coeff >= 0.0, "SPH:Physics:transport:coeff",
+                  "transport_coeff must be non-negative.");
 
     require_count(mxGetNumberOfElements(prhs[7]) == (mwSize)n_total,
                   "SPH:Physics:transport:Vol", "Vol size mismatch.");
@@ -683,7 +690,7 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
     for (int i = 0; i < n_fluid; ++i) {
         double n2 = inc_x[i] * inc_x[i] + inc_y[i] * inc_y[i];
         double limiter = 100.0 * n2 / (h * h);
-        double scale = 0.2 * h * h;
+        double scale = transport_coeff * h * h;
         if (limiter > 1.0) limiter = 1.0;
         if (limiter < 0.0) limiter = 0.0;
         pos_out_x[i] += scale * limiter * inc_x[i];

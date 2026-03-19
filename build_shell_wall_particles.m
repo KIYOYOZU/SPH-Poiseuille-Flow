@@ -1,5 +1,5 @@
 function [pos_wall, wall_normal, wall_measure, wall_thickness_arr] = build_shell_wall_particles(DL, DH, dp, wall_thickness)
-%BUILD_SHELL_WALL_PARTICLES 生成上下单层 shell 壁面粒子及其几何元数据。
+%BUILD_SHELL_WALL_PARTICLES 生成上下厚壁粒子区及其几何元数据。
     if nargin < 4
         error('build_shell_wall_particles 需要输入 DL, DH, dp, wall_thickness。');
     end
@@ -7,14 +7,28 @@ function [pos_wall, wall_normal, wall_measure, wall_thickness_arr] = build_shell
         error('DL, DH, dp 和 wall_thickness 必须为正数。');
     end
 
-    x_wall = (dp/2 : dp : DL - dp/2)';
-    nx = numel(x_wall);
+    n_layers = round(wall_thickness / dp);
+    if abs(n_layers * dp - wall_thickness) > 1e-12
+        error('wall_thickness 必须是 dp 的整数倍。');
+    end
+    if n_layers < 1
+        error('wall_thickness 至少需要一层粒子。');
+    end
 
-    pos_bottom = [x_wall, -0.5 * dp * ones(nx, 1)];
-    pos_top = [x_wall, (DH + 0.5 * dp) * ones(nx, 1)];
+    x_wall = (dp / 2 : dp : DL - dp / 2)';
+    y_bottom = ((-wall_thickness + dp / 2) : dp : (-dp / 2))';
+    y_top = ((DH + dp / 2) : dp : (DH + wall_thickness - dp / 2))';
+
+    [X_bottom, Y_bottom] = meshgrid(x_wall, y_bottom);
+    [X_top, Y_top] = meshgrid(x_wall, y_top);
+
+    pos_bottom = [X_bottom(:), Y_bottom(:)];
+    pos_top = [X_top(:), Y_top(:)];
     pos_wall = [pos_bottom; pos_top];
 
-    wall_normal = [repmat([0.0, -1.0], nx, 1); repmat([0.0, 1.0], nx, 1)];
-    wall_measure = dp * ones(2 * nx, 1);
-    wall_thickness_arr = wall_thickness * ones(2 * nx, 1);
+    n_bottom = size(pos_bottom, 1);
+    n_top = size(pos_top, 1);
+    wall_normal = [repmat([0.0, -1.0], n_bottom, 1); repmat([0.0, 1.0], n_top, 1)];
+    wall_measure = dp * ones(n_bottom + n_top, 1);
+    wall_thickness_arr = dp * ones(n_bottom + n_top, 1);
 end
