@@ -35,16 +35,15 @@ $$u(y) = \frac{g}{2\nu} y(H - y)$$
 - **核函数：** 2D Cubic Spline (Wendland C2)
 - **邻居搜索：** Cell-Linked List（网格链表法），支持周期性边界
 - **计算加速：** 模块化 MEX（邻居搜索 + 物理计算分离调用）+ OpenMP 多线程
-- **时间积分：** 双层时间步进（外层对流步 + 内层声学步）
-  - 对流时间步：基于 CFL 条件和粘性稳定性
-  - 声学时间步：基于人工声速的 CFL 条件
+- **时间积分：** 单层 CFL 时间步进（CFL = 0.3）
+  - 统一时间步：`dt = 0.3 * h / (c_f + |u|_max)`，并按输出点与终止时间裁剪
 - **密度计算：** 核函数求和 + 核梯度修正（Kernel Gradient Correction）
 - **压力方程：** 弱可压缩状态方程 p = p₀(ρ/ρ₀ - 1)
 - **粘性模型：** 基于核梯度修正的粘性力
 - **传输修正：** Transport Velocity Correction（抑制数值扩散）
 - **边界条件：**
   - X 方向：周期性边界（缓冲层宽度 4dp），fluid-wall 对同样做周期最小像距
-  - Y 方向：4 层壁面虚粒子（无滑移）+ PI 反馈控制（pair-wise tau 测量 → delta_tau 叠加 force_prior）+ 壁面防穿透
+  - Y 方向：单层 shell 壁面粒子（中面位于 `y=-0.5dp` 和 `y=DH+0.5dp`，厚度 `dp`）+ 唯一 no-slip + 壁面防穿透
 
 ### 架构特点
 - **配置驱动：** 所有参数通过 `config.ini` 配置
@@ -126,31 +125,21 @@ mex -R2018a -O CFLAGS="$CFLAGS -fopenmp" LDFLAGS="$LDFLAGS -fopenmp" -output sph
 - `sort_interval`：粒子排序间隔（步数）
 - `restart_from_file`：是否从 restart 文件续算（0=从零开始，1=续算）
 
-### 环境变量控制（可选）
+### 环境变量控制
 
-| 环境变量 | 作用 | 示例 |
-|---------|------|------|
-| `SPH_FORCE_MATLAB=1` | 禁用 MEX，强制使用 MATLAB 实现 | `$env:SPH_FORCE_MATLAB="1"` (PowerShell) |
-| `SPH_T_END=<数值>` | 覆盖默认仿真终止时间（秒） | `$env:SPH_T_END="1.0"` |
-
-**PowerShell 示例：**
-```powershell
-$env:SPH_T_END = "1.0"
-matlab -batch "run('SPH_Poiseuille.m')"
-Remove-Item Env:SPH_T_END
-```
+当前版本未启用额外的环境变量覆盖接口。若需调整仿真终止时间或其他参数，请直接修改 `config.ini`，然后使用 `matlab -batch "run('SPH_Poiseuille.m')"` 运行。
 
 ## 文件说明
 
 | 文件/目录 | 说明 |
 |------|------|
-| `SPH_Poiseuille.m` | 主程序，包含完整的 SPH 模拟代码与 MATLAB 回退实现 |
+| `SPH_Poiseuille.m` | 主程序，包含单层 shell 壁面与唯一 no-slip 的 SPH 模拟流程 |
+| `build_shell_wall_particles.m` | 单层 shell 壁面粒子几何生成函数 |
 | `config.ini` | 参数配置文件（物理参数 + 仿真控制） |
 | `mex/sph_neighbor_search_mex.c` | 邻居搜索 MEX（C+OpenMP）：Cell-Linked List + 周期性边界 |
 | `mex/sph_physics_mex.c` | 物理计算 MEX（C+OpenMP）：密度修正、粘性力、传输修正、时间积分 |
-| `mex/sph_step_mex.c` | 旧版融合 MEX（保留供参考，接口不兼容） |
 | `build/` | MEX 编译输出目录（自动生成，已在 `.gitignore` 中忽略） |
-| `restart/` | Restart 文件存储目录（自动生成） |
+| `restart.mat` | Restart 状态文件（运行过程中自动生成，用于续算） |
 | `SPH_Poiseuille_result.png` | 模拟结果可视化 |
 
 ## 性能优化建议
@@ -171,10 +160,10 @@ Remove-Item Env:SPH_T_END
 
 ## 技术特性
 
-### 1. 双层时间步进（Dual Time Stepping）
-- **外层对流步**：基于 CFL 条件和粘性稳定性
-- **内层声学步**：基于人工声速的 CFL 条件（`relaxation_time` 循环）
-- 每个对流步内部执行多次声学步，确保数值稳定性
+### 1. 单层 CFL 时间步进（Single CFL Stepping）
+- **统一时间步**：`dt = 0.3 * h / (c_f + |u|_max)`
+- **时间裁剪**：每步按 `output_interval` 和 `end_time` 自动截断，保证输出点对齐
+- **推进顺序**：每步依次执行密度修正、粘性力、传输修正、两阶段积分和边界处理
 
 ### 2. 核梯度修正（Kernel Gradient Correction）
 - 自动计算修正矩阵 B（2×2）
@@ -186,17 +175,23 @@ Remove-Item Env:SPH_T_END
 - 基于粒子数密度梯度计算修正速度
 - 参数：`transport_coeff = 0.25`
 
-### 4. 周期性边界（Periodic Boundary）
+### 4. 单层 Shell 壁面（Single-Layer Shell Wall）
+- 上下壁面各只有一层中面粒子
+- 壁面中面位置固定在 `y=-0.5dp` 和 `y=DH+0.5dp`
+- 每个壁面粒子显式携带厚度 `wall_thickness=dp`
+- 有效 wall 体积通过 `measure × thickness` 进入密度、粘性、压力和连续方程离散
+
+### 5. 周期性边界（Periodic Boundary）
 - X 方向周期性边界，缓冲层宽度 4dp
 - 自动包裹粒子位置：x = mod(x, DL)
 - 邻居搜索支持周期性镜像
 
-### 5. Restart 机制
+### 6. Restart 机制
 - 支持从断点续算，保存完整状态（位置、速度、密度、压力等）
 - 配置签名验证：确保 restart 文件与当前配置一致
 - 文件格式：MAT-file v7.3（支持大数据）
 
-### 6. 粒子排序优化
+### 7. 粒子排序优化
 - 定期按 Cell ID 排序（`sort_interval = 100` 步）
 - 提升缓存命中率，加速邻居搜索
 - 排序后自动重建邻居列表
