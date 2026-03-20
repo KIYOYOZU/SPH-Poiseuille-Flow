@@ -38,6 +38,7 @@ results/
 resolution_convergence.png
 resolution_results.mat
 .gitnexus
+.worktrees/
 **/docu/
 **/.claude/
 task_plan.md
