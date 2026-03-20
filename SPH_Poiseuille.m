@@ -48,13 +48,14 @@ rho0 = get_ini_numeric(cfg, 'physical', 'rho0');   % 参考密度
 mu = get_ini_numeric(cfg, 'physical', 'mu');       % 动力粘度
 U_bulk = get_ini_numeric(cfg, 'physical', 'U_bulk');  % 截面平均速度
 c_f = get_ini_numeric(cfg, 'physical', 'c_f');     % 人工声速因子
+wall_patch_count_x = round(get_ini_numeric_or_default(cfg, 'physical', 'wall_patch_count_x', 10));
 
 % 仿真控制参数
 t_end = get_ini_numeric(cfg, 'simulation', 'end_time');
 output_interval = get_ini_numeric(cfg, 'simulation', 'output_interval');
 sort_interval = round(get_ini_numeric(cfg, 'simulation', 'sort_interval'));
 restart_from_file = round(get_ini_numeric(cfg, 'simulation', 'restart_from_file'));
-fprintf('边界模式: 厚壁粒子 + 算子内 no-slip / no-penetration\n');
+fprintf('边界模式: 厚壁粒子 + patch ghost velocity 原型\n');
 
 % 几何参数自动对齐：确保 DL/dp 和 DH/dp 为整数（周期边界 + 均匀粒子排列）
 DL_raw = DL;  DH_raw = DH;
@@ -74,16 +75,22 @@ transport_coeff = 0.1;                           % dual-criteria 下保守的 sh
 p0 = rho0 * c_f^2;                              % 参考压力（弱可压缩状态方程）
 inv_sigma0 = dp^2;                               % 核函数归一化因子的倒数
 nu = mu / rho0;                                  % 运动粘度
+tau_target = abs(gravity_g * rho0 * DH / 2);       % 目标壁面剪应力大小
+main_flow_sign = sign(gravity_g);
 
 fprintf('参数: DL=%.3f, DH=%.3f, dp=%.4f, h=%.4f\n', DL, DH, dp, h);
 fprintf('参数: rho0=%.3f, mu=%.3f, U_bulk=%.6f, c_f=%.3f\n', rho0, mu, U_bulk, c_f);
 fprintf('派生: g=%.6f, Umax=%.6f, p0=%.6f, transport_coeff=%.3f\n', gravity_g, U_max, p0, transport_coeff);
 fprintf('仿真: end_time=%.3f, output_interval=%.3f, sort_interval=%d\n', t_end, output_interval, sort_interval);
 fprintf('周期边界: immediate wrap + minimum-image neighbor search\n');
-fprintf('壁面: 厚壁粒子区, BW=%.4f (%.0f*dp)\n', wall_thickness, wall_thickness / dp);
+fprintf('壁面: 厚壁粒子区, BW=%.4f (%.0f*dp), patch_x=%d\n', ...
+    wall_thickness, wall_thickness / dp, wall_patch_count_x);
 
 if sort_interval <= 0
     error('sort_interval 必须为正整数。');
+end
+if wall_patch_count_x <= 0
+    error('wall_patch_count_x 必须为正整数。');
 end
 
 %% S3: 粒子初始化
@@ -98,6 +105,7 @@ n_fluid = size(pos_fluid, 1);
 % 关键修复背景（3eb6de0）：旧单层 shell 壁面支撑不足，
 % 长时算例里会与硬 wall clip 一起放大近壁非物理扰动。
 [pos_wall, wall_normal, wall_measure, wall_thickness_arr] = build_shell_wall_particles(DL, DH, dp, wall_thickness);
+wall_patch = build_wall_patch_metadata(pos_wall, wall_normal, wall_measure, DL, DH, wall_patch_count_x);
 n_wall = size(pos_wall, 1);
 n_total = n_fluid + n_wall;
 
@@ -122,7 +130,7 @@ B(:, 4) = 1.0;
 fprintf('粒子数: fluid=%d, wall=%d, total=%d\n', n_fluid, n_wall, n_total);
 
 %% S4: Restart 检查
-config_signature = create_config_signature(DL, DH, dp, rho0, mu, U_bulk, c_f, t_end, output_interval, sort_interval);
+config_signature = create_config_signature(DL, DH, dp, rho0, mu, U_bulk, c_f, t_end, output_interval, sort_interval, wall_patch_count_x);
 t = 0.0;
 step = 0;
 
@@ -177,11 +185,14 @@ cfg = struct( ...
     'mu', mu, ...
     'U_bulk', U_bulk, ...
     'c_f', c_f, ...
+    'wall_patch_count_x', wall_patch_count_x, ...
     't_end', t_end, ...
     'output_interval', output_interval, ...
     'sort_interval', sort_interval, ...
     'restart_from_file', restart_from_file, ...
     'gravity_g', gravity_g, ...
+    'main_flow_sign', main_flow_sign, ...
+    'tau_target', tau_target, ...
     'U_max', U_max, ...
     'h', h, ...
     'wall_thickness', wall_thickness, ...
@@ -198,6 +209,8 @@ geom = struct( ...
     'n_total', n_total, ...
     'mass', mass, ...
     'wall_vel', wall_vel, ...
+    'wall_patch', wall_patch, ...
+    'wall_patch_state', struct(), ...
     'wall_normal', wall_normal, ...
     'wall_measure', wall_measure, ...
     'wall_thickness_arr', wall_thickness_arr);
@@ -224,8 +237,12 @@ neighbor = struct( ...
     'W_ij', W_ij, ...
     'dW_ij', dW_ij);
 
+[geom.wall_vel, geom.wall_patch_state] = update_wall_patch_ghost_velocity( ...
+    neighbor, state.vel, state.Vol, state.B, geom.wall_vel, geom.wall_patch, ...
+    geom.n_fluid, cfg.mu, cfg.h, cfg.tau_target, cfg.main_flow_sign);
+
 monitor = struct( ...
-    'tau_target', gravity_g * rho0 * DH / 2, ...
+    'tau_target', tau_target, ...
     'tau_num_bottom', 0.0, ...
     'tau_num_top', 0.0, ...
     'n_bins', max(20, round(DH / dp)), ...
@@ -263,6 +280,9 @@ while state.t < cfg.t_end - 1e-12
 
         [state.rho, state.Vol, state.B] = density_correction_mex( ...
             neighbor, geom.mass, geom.n_fluid, geom.n_total, cfg, physics_mex_name);
+        [geom.wall_vel, geom.wall_patch_state] = update_wall_patch_ghost_velocity( ...
+            neighbor, state.vel, state.Vol, state.B, geom.wall_vel, geom.wall_patch, ...
+            geom.n_fluid, cfg.mu, cfg.h, cfg.tau_target, cfg.main_flow_sign);
         state.force_prior = compute_force_prior_mex(state, geom, neighbor, cfg, physics_mex_name);
         state.pos = transport_correction_mex(state.pos, state.Vol, state.B, neighbor, geom, cfg, physics_mex_name);
 
@@ -716,6 +736,17 @@ function cfg = parse_ini(filename)
     end
 end
 
+function value = get_ini_numeric_or_default(cfg, section, key, default_value)
+    if ~isfield(cfg, section) || ~isfield(cfg.(section), key)
+        value = default_value;
+        return;
+    end
+    value = cfg.(section).(key);
+    if ~(isnumeric(value) && isscalar(value) && isfinite(value))
+        error('键 [%s].%s 不是有效数值。', section, key);
+    end
+end
+
 function value = get_ini_numeric(cfg, section, key)
     if ~isfield(cfg, section)
         error('缺少段: [%s]', section);
@@ -729,9 +760,9 @@ function value = get_ini_numeric(cfg, section, key)
     end
 end
 
-function sig = create_config_signature(DL, DH, dp, rho0, mu, U_bulk, c_f, t_end, output_interval, sort_interval)
-    sig = sprintf('DL=%.12g|DH=%.12g|dp=%.12g|rho0=%.12g|mu=%.12g|Ub=%.12g|cf=%.12g|t=%.12g|oi=%.12g|si=%d|wall=thick-wall-noslip-dual-dt', ...
-        DL, DH, dp, rho0, mu, U_bulk, c_f, t_end, output_interval, sort_interval);
+function sig = create_config_signature(DL, DH, dp, rho0, mu, U_bulk, c_f, t_end, output_interval, sort_interval, wall_patch_count_x)
+    sig = sprintf('DL=%.12g|DH=%.12g|dp=%.12g|rho0=%.12g|mu=%.12g|Ub=%.12g|cf=%.12g|t=%.12g|oi=%.12g|si=%d|patchx=%d|wall=thick-wall-patch-ghost-dual-dt', ...
+        DL, DH, dp, rho0, mu, U_bulk, c_f, t_end, output_interval, sort_interval, wall_patch_count_x);
 end
 
 function dt = cfl_time_step(vel, c_f, h, remain)
