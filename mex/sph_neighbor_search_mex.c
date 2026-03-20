@@ -40,6 +40,71 @@ typedef struct {
     mwSize capacity;
 } PairBuffer;
 
+typedef struct {
+    int *head;
+    int *next;
+    int *particle;
+    double *x;
+    double *y;
+    mwSize count;
+    mwSize capacity;
+} CellEntryBuffer;
+
+static int wrap_cell_index(int cell_index, int n_cell_x)
+{
+    if (n_cell_x <= 0) {
+        return 0;
+    }
+    cell_index %= n_cell_x;
+    if (cell_index < 0) {
+        cell_index += n_cell_x;
+    }
+    return cell_index;
+}
+
+static void init_cell_entry_buffer(CellEntryBuffer *buf, int n_cells, mwSize capacity)
+{
+    int i;
+    buf->count = 0;
+    buf->capacity = capacity;
+    buf->head = (int *)mxMalloc((mwSize)n_cells * sizeof(int));
+    buf->next = (int *)mxMalloc(capacity * sizeof(int));
+    buf->particle = (int *)mxMalloc(capacity * sizeof(int));
+    buf->x = (double *)mxMalloc(capacity * sizeof(double));
+    buf->y = (double *)mxMalloc(capacity * sizeof(double));
+
+    for (i = 0; i < n_cells; ++i) {
+        buf->head[i] = -1;
+    }
+}
+
+static void insert_cell_entry(CellEntryBuffer *buf, int particle, double x, double y,
+                              int cxi, int cyi, int n_cell_x)
+{
+    mwSize entry = buf->count;
+    int cid = cyi * n_cell_x + cxi;
+
+    if (entry >= buf->capacity) {
+        mexErrMsgIdAndTxt("SPH:Neighbor:entryCapacity", "Cell entry capacity exceeded.");
+    }
+
+    buf->particle[entry] = particle;
+    buf->x[entry] = x;
+    buf->y[entry] = y;
+    buf->next[entry] = buf->head[cid];
+    buf->head[cid] = (int)entry;
+    buf->count++;
+}
+
+static void free_cell_entry_buffer(CellEntryBuffer *buf)
+{
+    if (buf->head) mxFree(buf->head);
+    if (buf->next) mxFree(buf->next);
+    if (buf->particle) mxFree(buf->particle);
+    if (buf->x) mxFree(buf->x);
+    if (buf->y) mxFree(buf->y);
+}
+
 /* 2D 三次样条核函数及其径向导数 */
 static void cubic_kernel_2d(double r, double h, double *W, double *dW)
 {
@@ -128,14 +193,15 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     int n_cell_y;               /* Y 方向单元格数 */
     int n_cells;                /* 总单元格数 */
     /* ---- 链表法数据结构 ---- */
-    int *cell_head;             /* 每个单元格的头粒子索引 [n_cells] */
-    int *next_in_cell;          /* 链表：下一个粒子索引 [n_total] */
-    int *cell_x;                /* 粒子所在单元格 x 索引 [n_total] */
-    int *cell_y;                /* 粒子所在单元格 y 索引 [n_total] */
+    CellEntryBuffer entries;    /* 周期 ghost entry + 实粒子 entry */
+    int *cell_x;                /* 实粒子所在单元格 x 索引 [n_total] */
+    int *cell_y;                /* 实粒子所在单元格 y 索引 [n_total] */
+    int *seen_neighbor;         /* 每个流体粒子的去重标记 [n_total] */
     int i;                      /* 循环索引 */
     /* ---- 粒子对缓冲区 ---- */
     PairBuffer buf;             /* 动态数组存储粒子对 */
     const double r_cut = 2.0;   /* 截断半径（单位：h） */
+    double periodic_cutoff;     /* 周期 ghost 插入阈值 = 2h */
     double r_cut_sq;            /* 截断半径平方 */
     mwSize out_count;           /* 最终粒子对数量 */
 
@@ -183,44 +249,48 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     if (n_cell_y < 1) n_cell_y = 1;
     n_cells = n_cell_x * n_cell_y;
 
-    cell_head = (int *)mxMalloc((mwSize)n_cells * sizeof(int));
-    next_in_cell = (int *)mxMalloc((mwSize)n_total * sizeof(int));
     cell_x = (int *)mxMalloc((mwSize)n_total * sizeof(int));
     cell_y = (int *)mxMalloc((mwSize)n_total * sizeof(int));
+    seen_neighbor = (int *)mxMalloc((mwSize)n_total * sizeof(int));
 
-    /* 第三步：初始化链表头（-1 表示空单元格） */
-    for (i = 0; i < n_cells; ++i) {
-        cell_head[i] = -1;
-    }
+    periodic_cutoff = r_cut * h;
+    init_cell_entry_buffer(&entries, n_cells, (mwSize)n_total * 3);
 
-    /* 第四步：将所有粒子分配到单元格（X 方向周期包裹）
-     * 链表法：cell_head[cid] 指向该单元格第一个粒子，
-     *         next_in_cell[i] 指向下一个粒子，-1 表示链表结束 */
+    /* 第三步：将所有粒子分配到单元格，并为周期边界附近粒子插入 ghost entry。 */
     for (i = 0; i < n_total; ++i) {
-        double xi = x[i];
+        double xi_wrapped = x[i] - floor(x[i] / DL) * DL;
         double yi = y[i];
-        int cxi;
+        int cxi = wrap_cell_index((int)floor(xi_wrapped / cell_size), n_cell_x);
         int cyi = (int)floor((yi - y_min) / cell_size);
-        int cid;
 
-        /* 所有粒子（含壁面）统一做周期包裹后分配 cell */
-        double xi_wrapped = xi - floor(xi / DL) * DL;
-        cxi = (int)floor(xi_wrapped / cell_size);
-
-        if (cxi < 0) cxi = 0;
-        if (cxi >= n_cell_x) cxi = n_cell_x - 1;
         if (cyi < 0) cyi = 0;
         if (cyi >= n_cell_y) cyi = n_cell_y - 1;
 
         cell_x[i] = cxi;
         cell_y[i] = cyi;
-        cid = cyi * n_cell_x + cxi;
+        insert_cell_entry(&entries, i, xi_wrapped, yi, cxi, cyi, n_cell_x);
 
-        next_in_cell[i] = cell_head[cid];
-        cell_head[cid] = i;
+        if (xi_wrapped > DL - periodic_cutoff) {
+            double ghost_x = xi_wrapped - DL;
+            int ghost_cx = wrap_cell_index((int)floor(ghost_x / cell_size), n_cell_x);
+            if (ghost_cx != cxi) {
+                insert_cell_entry(&entries, i, ghost_x, yi, ghost_cx, cyi, n_cell_x);
+            }
+        }
+        if (xi_wrapped < periodic_cutoff) {
+            double ghost_x = xi_wrapped + DL;
+            int ghost_cx = wrap_cell_index((int)floor(ghost_x / cell_size), n_cell_x);
+            if (ghost_cx != cxi) {
+                insert_cell_entry(&entries, i, ghost_x, yi, ghost_cx, cyi, n_cell_x);
+            }
+        }
     }
 
-    /* 第五步：初始化粒子对缓冲区（动态数组） */
+    for (i = 0; i < n_total; ++i) {
+        seen_neighbor[i] = -1;
+    }
+
+    /* 第四步：初始化粒子对缓冲区（动态数组） */
     init_pair_buffer(&buf, (mwSize)n_fluid * 64 + 1024);
     r_cut_sq = (r_cut * h) * (r_cut * h);
 
@@ -253,11 +323,12 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
                     continue;
                 }
                 int cid = cy * n_cell_x + cx;
-                int j = cell_head[cid];
+                int entry = entries.head[cid];
 
-                /* 遍历该单元格内的所有粒子（链表法） */
-                while (j >= 0) {
-                    if (j != i) {
+                /* 遍历该单元格内的所有 entry（实粒子 + 必要 ghost entry） */
+                while (entry >= 0) {
+                    int j = entries.particle[entry];
+                    if (j != i && seen_neighbor[j] != i) {
                         int skip_pair = 0;
                         double dx_ij;
                         double dy_ij;
@@ -265,20 +336,21 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
                         double r_ij;
                         double W_ij;
                         double dW_ij;
+                        double xi_wrapped = x[i] - floor(x[i] / DL) * DL;
 
                         /* 流体-流体对：只存储 i < j 避免重复 */
                         if (j < n_fluid && j < i) {
                             skip_pair = 1;
                         }
                         if (!skip_pair) {
-                            dx_ij = x[i] - x[j];
+                            dx_ij = xi_wrapped - entries.x[entry];
                             /* 最小镜像约定：选择最短距离（周期性边界） */
                             if (dx_ij > 0.5 * DL) {
                                 dx_ij -= DL;
                             } else if (dx_ij < -0.5 * DL) {
                                 dx_ij += DL;
                             }
-                            dy_ij = y[i] - y[j];
+                            dy_ij = y[i] - entries.y[entry];
                             r2 = dx_ij * dx_ij + dy_ij * dy_ij;
 
                             /* 距离筛选：r > 0 且 r < 2h（截断半径） */
@@ -297,11 +369,12 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
                                     buf.W[buf.count] = W_ij;
                                     buf.dW[buf.count] = dW_ij;
                                     buf.count++;
+                                    seen_neighbor[j] = i;
                                 }
                             }
                         }
                     }
-                    j = next_in_cell[j];  /* 链表下一个粒子 */
+                    entry = entries.next[entry];
                 }
             }
         }
@@ -330,8 +403,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 
     /* 第八步：清理内存 */
     free_pair_buffer(&buf);
-    mxFree(cell_head);
-    mxFree(next_in_cell);
+    free_cell_entry_buffer(&entries);
     mxFree(cell_x);
     mxFree(cell_y);
+    mxFree(seen_neighbor);
 }
