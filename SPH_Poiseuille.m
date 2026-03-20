@@ -22,6 +22,8 @@ results_dir = fullfile(project_dir, 'results');
 result_png = get_env_override('SPH_RESULT_PNG_OVERRIDE', fullfile(results_dir, 'SPH_Poiseuille_result.png'));
 profile_evolution_png = get_env_override('SPH_PROFILE_PNG_OVERRIDE', ...
     fullfile(results_dir, 'SPH_centerline_profile_evolution.png'));
+postprocess_mat_path = get_env_override('SPH_POSTPROCESS_MAT_OVERRIDE', ...
+    fullfile(results_dir, 'SPH_Poiseuille_postprocess.mat'));
 
 if ~exist(build_dir, 'dir')
     mkdir(build_dir);
@@ -29,6 +31,7 @@ end
 ensure_parent_dir(restart_path);
 ensure_parent_dir(result_png);
 ensure_parent_dir(profile_evolution_png);
+ensure_parent_dir(postprocess_mat_path);
 addpath(build_dir);
 
 %% S1: MEX 自动编译
@@ -325,181 +328,12 @@ while state.t < cfg.t_end - 1e-12
     monitor.mid_profile_u(:, end + 1) = u_mid_now;
 end
 
-%% S7: 后处理与验证
-% 提取流体粒子速度剖面，与泊肃叶流解析解对比
-fluid_pos = state.pos(1:geom.n_fluid, :);
-fluid_pos(:, 1) = mod(fluid_pos(:, 1), cfg.DL);
-fluid_vel = state.vel(1:geom.n_fluid, :);
-
-[y_mid, u_mean] = compute_binned_profile_mean(fluid_pos(:, 2), fluid_vel(:, 1), 0.0, cfg.DH, monitor.n_bins);
-% 无滑移 BC 下解析解：标准抛物线
-u_exact = cfg.gravity_g / (2.0 * cfg.nu) .* y_mid .* (cfg.DH - y_mid);
-
-valid = ~isnan(u_mean);
-if ~any(valid)
-    error('后处理失败：速度剖面分箱为空。');
-end
-
-L2_error = sqrt(sum((u_mean(valid) - u_exact(valid)).^2) / max(sum(u_exact(valid).^2), eps));
-fprintf('L2 相对误差 = %.4f%%\n', 100.0 * L2_error);
-
-if L2_error < 0.05
-    fprintf('验证通过: L2_error < 5%%\n');
-else
-    fprintf('验证未达标: L2_error >= 5%%\n');
-end
-
-fig = figure('Color', 'w', 'Position', [100, 100, 1400, 520], 'Renderer', 'painters');
-
-% --- 左图：速度剖面对比 ---
-ax1 = subplot(1, 2, 1);
-y_norm = y_mid / cfg.DH;
-u_norm_exact = u_exact / cfg.U_max;
-u_norm_sph   = u_mean  / cfg.U_max;
-
-plot(ax1, u_norm_exact, y_norm, '-', 'Color', [0.1 0.1 0.1], 'LineWidth', 1.8); hold(ax1, 'on');
-plot(ax1, u_norm_sph, y_norm, 'o', 'Color', [0.85 0.2 0.2], ...
-    'MarkerSize', 5, 'LineWidth', 1.2, 'MarkerFaceColor', [0.85 0.2 0.2]);
-hold(ax1, 'off');
-
-set(ax1, 'FontName', 'Times New Roman', 'FontSize', 13, 'LineWidth', 1.0, ...
-    'TickDir', 'in', 'TickLength', [0.015 0.015], 'Box', 'on');
-xlabel(ax1, '$u_x / U_{max}$', 'Interpreter', 'latex', 'FontSize', 14);
-ylabel(ax1, '$y / H$', 'Interpreter', 'latex', 'FontSize', 14);
-legend(ax1, {'Analytical', 'SPH'}, 'Location', 'southeast', ...
-    'FontSize', 11, 'FontName', 'Times New Roman', 'Box', 'off');
-xlim(ax1, [-0.05, 1.15]);
-ylim(ax1, [0, 1]);
-text(ax1, 0.05, 0.95, sprintf('$L_2 = %.2f\\%%$', 100*L2_error), ...
-    'Units', 'normalized', 'Interpreter', 'latex', 'FontSize', 12, ...
-    'HorizontalAlignment', 'left', 'VerticalAlignment', 'top', ...
-    'FontName', 'Times New Roman');
-title(ax1, '(a) Velocity profile', 'FontName', 'Times New Roman', ...
-    'FontSize', 13, 'FontWeight', 'normal');
-
-% --- 右图：光滑速度场 ---
-ax2 = subplot(1, 2, 2);
-
-% 构建规则网格，分辨率与粒子间距匹配
-nx_grid = round(cfg.DL / cfg.dp) * 2;
-ny_grid = round(cfg.DH / cfg.dp) * 2;
-xg = linspace(0, cfg.DL, nx_grid);
-yg = linspace(0, cfg.DH, ny_grid);
-[Xg, Yg] = meshgrid(xg, yg);
-
-% 将周期性流体粒子位置展开，补 ghost 粒子处理周期边界
-fp_x = mod(fluid_pos(:,1), cfg.DL);
-fp_y = fluid_pos(:,2);
-fv_x = fluid_vel(:,1);
-% 左侧 ghost：把右侧粒子（x > DL - 2h）复制到 x - DL
-right_mask = fp_x > cfg.DL - 2*cfg.h;
-% 右侧 ghost：把左侧粒子（x < 2h）复制到 x + DL
-left_mask  = fp_x < 2*cfg.h;
-fp_x_ext = [fp_x; fp_x(right_mask) - cfg.DL; fp_x(left_mask) + cfg.DL];
-fp_y_ext = [fp_y; fp_y(right_mask);       fp_y(left_mask)];
-fv_x_ext = [fv_x; fv_x(right_mask);      fv_x(left_mask)];
-F_interp = scatteredInterpolant(fp_x_ext, fp_y_ext, fv_x_ext, 'natural', 'nearest');
-Ug = F_interp(Xg, Yg);
-
-% 厚壁粒子区显示范围
-wall_thick = cfg.wall_thickness;
-y_lo = -wall_thick;
-y_hi = cfg.DH + wall_thick;
-
-% 绘制下壁面灰色区域
-fill(ax2, [0 cfg.DL cfg.DL 0], [y_lo y_lo 0 0], [0.75 0.75 0.75], ...
-    'EdgeColor', 'none'); hold(ax2, 'on');
-% 绘制上壁面灰色区域
-fill(ax2, [0 cfg.DL cfg.DL 0], [cfg.DH cfg.DH y_hi y_hi], [0.75 0.75 0.75], ...
-    'EdgeColor', 'none');
-% 壁面边界线
-plot(ax2, [0 cfg.DL], [0 0], 'k-', 'LineWidth', 1.2);
-plot(ax2, [0 cfg.DL], [cfg.DH cfg.DH], 'k-', 'LineWidth', 1.2);
-
-% 流体速度场
-imagesc(ax2, xg, yg, Ug);
-set(ax2, 'YDir', 'normal');
-
-% 重绘壁面（imagesc 会覆盖 fill）
-fill(ax2, [0 cfg.DL cfg.DL 0], [y_lo y_lo 0 0], [0.75 0.75 0.75], 'EdgeColor', 'none');
-fill(ax2, [0 cfg.DL cfg.DL 0], [cfg.DH cfg.DH y_hi y_hi], [0.75 0.75 0.75], 'EdgeColor', 'none');
-plot(ax2, [0 cfg.DL], [0 0], 'k-', 'LineWidth', 1.2);
-plot(ax2, [0 cfg.DL], [cfg.DH cfg.DH], 'k-', 'LineWidth', 1.2);
-
-% 壁面标注
-text(ax2, cfg.DL/2, y_lo/2, 'Wall', 'HorizontalAlignment', 'center', ...
-    'FontName', 'Times New Roman', 'FontSize', 11, 'Color', [0.3 0.3 0.3]);
-text(ax2, cfg.DL/2, cfg.DH + wall_thick/2, 'Wall', 'HorizontalAlignment', 'center', ...
-    'FontName', 'Times New Roman', 'FontSize', 11, 'Color', [0.3 0.3 0.3]);
-hold(ax2, 'off');
-
-axis(ax2, 'equal');
-xlim(ax2, [0, cfg.DL]);
-ylim(ax2, [y_lo, y_hi]);
-set(ax2, 'FontName', 'Times New Roman', 'FontSize', 13, 'LineWidth', 1.0, ...
-    'TickDir', 'in', 'TickLength', [0.015 0.015], 'Box', 'on');
-xlabel(ax2, '$x$ (m)', 'Interpreter', 'latex', 'FontSize', 14);
-ylabel(ax2, '$y$ (m)', 'Interpreter', 'latex', 'FontSize', 14);
-colormap(ax2, turbo);
-caxis(ax2, [0, cfg.U_max * 1.1]);
-cb = colorbar(ax2);
-cb.Label.String = '$u_x$ (m/s)';
-cb.Label.Interpreter = 'latex';
-cb.Label.FontSize = 13;
-set(cb, 'FontName', 'Times New Roman', 'FontSize', 11, ...
-    'TickDirection', 'in', 'LineWidth', 1.0);
-title(ax2, '(b) Velocity field', 'FontName', 'Times New Roman', ...
-    'FontSize', 13, 'FontWeight', 'normal');
-
-saveas(fig, result_png);
-fprintf('结果图已保存: %s\n', result_png);
-
-% --- 中间截面速度剖面演化图（每个时间一条剖面） ---
-fig_evo = figure('Color', 'w', 'Position', [140, 140, 760, 560], 'Renderer', 'painters');
-ax_evo = axes(fig_evo);
-hold(ax_evo, 'on');
-
-tvals = monitor.profile_times(:)';
-n_profiles = numel(tvals);
-line_cmap = parula(max(n_profiles, 2));
-
-for k = 1:n_profiles
-    u_k = monitor.mid_profile_u(:, k) / cfg.U_max;
-    valid_k = ~isnan(u_k);
-    if any(valid_k)
-        plot(ax_evo, u_k(valid_k), y_mid(valid_k) / cfg.DH, '-', ...
-            'Color', line_cmap(k, :), 'LineWidth', 1.0);
-    end
-end
-
-plot(ax_evo, u_norm_exact, y_norm, '--', 'Color', [0.1 0.1 0.1], 'LineWidth', 1.6);
-hold(ax_evo, 'off');
-
-set(ax_evo, 'FontName', 'Times New Roman', 'FontSize', 13, 'LineWidth', 1.0, ...
-    'TickDir', 'in', 'TickLength', [0.015 0.015], 'Box', 'on');
-xlabel(ax_evo, '$u_x / U_{max}$', 'Interpreter', 'latex', 'FontSize', 14);
-ylabel(ax_evo, '$y / H$', 'Interpreter', 'latex', 'FontSize', 14);
-xlim(ax_evo, [-0.05, 1.15]);
-ylim(ax_evo, [0, 1]);
-title(ax_evo, '(c) Mid-channel profile evolution', 'FontName', 'Times New Roman', ...
-    'FontSize', 13, 'FontWeight', 'normal');
-
-colormap(ax_evo, line_cmap);
-t_min = min(tvals);
-t_max = max(tvals);
-if t_max <= t_min
-    t_max = t_min + 1.0;
-end
-caxis(ax_evo, [t_min, t_max]);
-cb_evo = colorbar(ax_evo);
-cb_evo.Label.String = '$t$ (s)';
-cb_evo.Label.Interpreter = 'latex';
-cb_evo.Label.FontSize = 12;
-set(cb_evo, 'FontName', 'Times New Roman', 'FontSize', 11, ...
-    'TickDirection', 'in', 'LineWidth', 1.0);
-
-saveas(fig_evo, profile_evolution_png);
-fprintf('中间截面剖面演化图已保存: %s\n', profile_evolution_png);
+%% S7: 写出独立后处理所需数据
+postprocess_data = make_postprocess_data(cfg, geom, state, monitor, result_png, profile_evolution_png);
+save_postprocess_data(postprocess_mat_path, postprocess_data);
+fprintf('后处理数据已保存: %s\n', postprocess_mat_path);
+fprintf('后处理请单独运行: matlab -batch "cd(''%s''); SPH_Poiseuille_postprocess(''%s'');"\n', ...
+    project_dir, postprocess_mat_path);
 
 %% Local Functions
 function ensure_mex_compiled(src_path, out_name, build_dir)
@@ -824,6 +658,36 @@ end
 function save_restart(restart_path, config_signature, state)
 % 保存重启文件（包含完整粒子状态和配置签名，用于断点续算）
     save(restart_path, 'state', 'config_signature', '-v7.3');
+end
+
+function save_postprocess_data(postprocess_mat_path, postprocess_data)
+% 保存独立后处理所需的最小数据集，避免绘图逻辑耦合到主求解脚本。
+    save(postprocess_mat_path, 'postprocess_data', '-v7.3');
+end
+
+function postprocess_data = make_postprocess_data(cfg, geom, state, monitor, result_png, profile_evolution_png)
+% 汇总后处理输入，供独立脚本加载 mat 后生成图像与验证指标。
+    fluid_pos = state.pos(1:geom.n_fluid, :);
+    fluid_pos(:, 1) = mod(fluid_pos(:, 1), cfg.DL);
+    fluid_vel_x = state.vel(1:geom.n_fluid, 1);
+    [y_mid, u_mean] = compute_binned_profile_mean(fluid_pos(:, 2), fluid_vel_x, 0.0, cfg.DH, monitor.n_bins);
+    u_exact = cfg.gravity_g / (2.0 * cfg.nu) .* y_mid .* (cfg.DH - y_mid);
+
+    postprocess_data = struct( ...
+        'cfg', cfg, ...
+        'geom', struct('n_fluid', geom.n_fluid), ...
+        'state', struct('pos', state.pos, 'vel', state.vel), ...
+        'monitor', struct( ...
+            'n_bins', monitor.n_bins, ...
+            'profile_times', monitor.profile_times, ...
+            'mid_profile_u', monitor.mid_profile_u), ...
+        'final_profile', struct( ...
+            'y_mid', y_mid, ...
+            'u_mean', u_mean, ...
+            'u_exact', u_exact), ...
+        'output', struct( ...
+            'result_png', result_png, ...
+            'profile_evolution_png', profile_evolution_png));
 end
 
 function pos = bounding_from_wall(pos, n_fluid, DH, dp)
