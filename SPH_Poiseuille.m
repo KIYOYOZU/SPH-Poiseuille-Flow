@@ -2,6 +2,7 @@
 % 基于 SPH（光滑粒子流体动力学）方法的二维平板泊肃叶流动模拟
 % 采用弱可压缩 SPH + dual-criteria 时间步进
 % 计算加速：C/MEX + OpenMP（邻居搜索与物理计算分离）
+% 当前默认链路：厚壁粒子区 + 周期 ghost 邻居搜索 + dual-criteria 声学子步
 
 clear; clc; close all;
 
@@ -17,9 +18,10 @@ build_dir = fullfile(project_dir, 'build');     % MEX 编译输出目录
 mex_dir = fullfile(project_dir, 'mex');         % MEX C 源码目录
 config_path = get_env_override('SPH_CONFIG_OVERRIDE', fullfile(project_dir, 'config.ini'));
 restart_path = get_env_override('SPH_RESTART_PATH_OVERRIDE', fullfile(project_dir, 'restart.mat'));
-result_png = get_env_override('SPH_RESULT_PNG_OVERRIDE', fullfile(project_dir, 'SPH_Poiseuille_result.png'));
+results_dir = fullfile(project_dir, 'results');
+result_png = get_env_override('SPH_RESULT_PNG_OVERRIDE', fullfile(results_dir, 'SPH_Poiseuille_result.png'));
 profile_evolution_png = get_env_override('SPH_PROFILE_PNG_OVERRIDE', ...
-    fullfile(project_dir, 'SPH_centerline_profile_evolution.png'));
+    fullfile(results_dir, 'SPH_centerline_profile_evolution.png'));
 
 if ~exist(build_dir, 'dir')
     mkdir(build_dir);
@@ -93,6 +95,8 @@ pos_fluid = [X_fluid(:), Y_fluid(:)];
 n_fluid = size(pos_fluid, 1);
 
 % 厚壁粒子区：上下各 BW 厚度的规则壁面粒子层
+% 关键修复背景（3eb6de0）：旧单层 shell 壁面支撑不足，
+% 长时算例里会与硬 wall clip 一起放大近壁非物理扰动。
 [pos_wall, wall_normal, wall_measure, wall_thickness_arr] = build_shell_wall_particles(DL, DH, dp, wall_thickness);
 n_wall = size(pos_wall, 1);
 n_total = n_fluid + n_wall;
@@ -239,6 +243,8 @@ monitor.mid_profile_u(:, end + 1) = u_mid_init;
 %% S6: 主循环（dual-criteria 时间步进）
 % 每个外层对流/黏性步 Dt 只做一次密度求和、核修正、粘性力和传输修正，
 % 然后在 Dt 内部执行多次声学子步推进压力/密度松弛。
+% 关键修复背景（3eb6de0）：旧版“单层 CFL + 每步较强 transport correction”
+% 会持续放大近壁横向脉动，所以当前把 shifting 限定在外层步。
 while state.t < cfg.t_end - 1e-12
     target_time = min(state.t + cfg.output_interval, cfg.t_end);
 
@@ -395,7 +401,7 @@ fv_x_ext = [fv_x; fv_x(right_mask);      fv_x(left_mask)];
 F_interp = scatteredInterpolant(fp_x_ext, fp_y_ext, fv_x_ext, 'natural', 'nearest');
 Ug = F_interp(Xg, Yg);
 
-% shell 壁面显示厚度
+% 厚壁粒子区显示范围
 wall_thick = cfg.wall_thickness;
 y_lo = -wall_thick;
 y_hi = cfg.DH + wall_thick;
@@ -548,6 +554,7 @@ function ensure_parent_dir(file_path)
 end
 
 function neighbor = build_neighbor_cache(pos, n_fluid, n_total, h, DL, neighbor_mex_name)
+% 统一封装周期邻居搜索 MEX，返回供各物理算子复用的 pair cache。
     [pair_i, pair_j, dx_ij, dy_ij, r_ij, W_ij, dW_ij] = feval( ...
         neighbor_mex_name, pos, n_fluid, n_total, h, DL);
     neighbor = struct( ...
@@ -561,6 +568,7 @@ function neighbor = build_neighbor_cache(pos, n_fluid, n_total, h, DL, neighbor_
 end
 
 function [rho, Vol, B] = density_correction_mex(neighbor, mass, n_fluid, n_total, cfg, physics_mex_name)
+% 调用密度重初始化与核梯度修正 mode，保持主循环只负责状态编排。
     [rho, Vol, B] = feval( ...
         physics_mex_name, 'density_correction', ...
         neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.W_ij, neighbor.dW_ij, ...
@@ -568,6 +576,7 @@ function [rho, Vol, B] = density_correction_mex(neighbor, mass, n_fluid, n_total
 end
 
 function force_prior = compute_force_prior_mex(state, geom, neighbor, cfg, physics_mex_name)
+% 计算黏性先验力并叠加体积力，供后续压力步做速度更新。
     force_prior = feval( ...
         physics_mex_name, 'viscous_force', ...
         neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.dW_ij, ...
@@ -577,6 +586,7 @@ function force_prior = compute_force_prior_mex(state, geom, neighbor, cfg, physi
 end
 
 function pos = transport_correction_mex(pos, Vol, B, neighbor, geom, cfg, physics_mex_name)
+% 外层步执行一次粒子 shifting，抑制聚集但不直接修改速度。
     pos = feval( ...
         physics_mex_name, 'transport_correction', ...
         neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.dW_ij, ...
@@ -584,6 +594,7 @@ function pos = transport_correction_mex(pos, Vol, B, neighbor, geom, cfg, physic
 end
 
 function [rho, p, pos, force, drho_dt] = integration_1st_mex(state, geom, neighbor, cfg, dt_step, physics_mex_name)
+% 第一阶段声学子步：半步推进 rho/pos，并计算压力梯度力。
     [rho, p, pos, force, drho_dt] = feval( ...
         physics_mex_name, 'integration_1st', ...
         neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.dW_ij, ...
@@ -592,12 +603,14 @@ function [rho, p, pos, force, drho_dt] = integration_1st_mex(state, geom, neighb
 end
 
 function vel = update_velocity(vel, mass, force_prior, force, n_fluid, n_total, dt_step)
+% 用黏性先验力与压力力更新流体速度，壁粒子速度始终保持零。
     acc_fluid = (force_prior(1:n_fluid, :) + force(1:n_fluid, :)) ./ mass(1:n_fluid);
     vel(1:n_fluid, :) = vel(1:n_fluid, :) + acc_fluid * dt_step;
     vel(n_fluid+1:n_total, :) = 0.0;
 end
 
 function [pos, drho_dt] = integration_2nd_mex(state, geom, neighbor, dt_step, physics_mex_name)
+% 第二阶段声学子步：完成位置推进，并返回密度散度修正项。
     [pos, drho_dt, ~] = feval( ...
         physics_mex_name, 'integration_2nd', ...
         neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.dW_ij, ...
@@ -620,6 +633,7 @@ function sink = void_buffer(~)
 end
 
 function state = advance_one_step_mex(state, geom, neighbor, cfg, dt_step, physics_mex_name)
+% 兼容旧单步推进门面；当前 dual-criteria 主循环默认不走这条路径。
     [state.rho, state.p, state.pos, state.vel, state.drho_dt, state.force, state.force_prior, state.Vol, state.B] = feval( ...
         physics_mex_name, 'advance_shell_step', ...
         neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.W_ij, neighbor.dW_ij, ...
@@ -628,6 +642,7 @@ function state = advance_one_step_mex(state, geom, neighbor, cfg, dt_step, physi
 end
 
 function [tau_bottom, tau_top] = wall_shear_monitor_mex(neighbor, pos, vel, wall_vel, Vol, B, n_fluid, DL, DH, mu, h, physics_mex_name)
+% 读取 MEX 侧壁面剪应力监控值，不改动任何粒子状态。
     [tau_bottom, tau_top] = feval( ...
         physics_mex_name, 'wall_shear_monitor', ...
         neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.dW_ij, ...
@@ -812,7 +827,7 @@ function save_restart(restart_path, config_signature, state)
 end
 
 function pos = bounding_from_wall(pos, n_fluid, DH, dp)
-% 壁面防穿透：粒子到壁面距离 < 0.25*dp 时，弹回到 0.5*dp 处
+% 旧的硬壁回弹辅助函数；当前厚壁/no-penetration 主路径不再调用。
     dist_min = 0.25 * dp;
     half_dp = 0.5 * dp;
     y = pos(1:n_fluid, 2);

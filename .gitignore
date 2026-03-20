@@ -34,6 +34,7 @@ result_*.png
 .claude/settings.local.json
 壁面边界条件报告.md
 restart.mat
+results/
 resolution_convergence.png
 resolution_results.mat
 .gitnexus

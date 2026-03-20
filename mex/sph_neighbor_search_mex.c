@@ -3,8 +3,11 @@
  * 基于链表法的 2D SPH 邻居搜索（X 方向周期性边界），支持 OpenMP 并行。
  *
  * 算法：将粒子分配到 2D 网格单元（cell_size = 2h），
- *       遍历相邻 9 个单元查找截断半径内的粒子对。
- *       流体-流体对使用最小镜像约定处理 X 方向周期性。
+ *       对靠近 X 周期边界的粒子额外插入平移 ghost entry，
+ *       再遍历相邻 9 个单元查找截断半径内的粒子对。
+ *       输出时仍使用 minimum-image 约定计算距离，并对 real/ghost entry 去重。
+ *       关键修复背景（3d620e8）：旧实现只搜索 wrapped cell 的 3x3 邻域，
+ *       会漏掉接缝两侧仍在 2h 内的跨周期近邻，进而拉坏长时速度剖面连续性。
  *
  * Usage:
  *   [pair_i, pair_j, dx, dy, r, W, dW] = sph_neighbor_search_mex(pos, n_fluid, n_total, h, DL)
@@ -50,6 +53,7 @@ typedef struct {
     mwSize capacity;
 } CellEntryBuffer;
 
+/* 将 X 方向单元格索引包裹到 [0, n_cell_x) 内。 */
 static int wrap_cell_index(int cell_index, int n_cell_x)
 {
     if (n_cell_x <= 0) {
@@ -62,6 +66,7 @@ static int wrap_cell_index(int cell_index, int n_cell_x)
     return cell_index;
 }
 
+/* 初始化 real/ghost entry 共用的链表缓冲区。 */
 static void init_cell_entry_buffer(CellEntryBuffer *buf, int n_cells, mwSize capacity)
 {
     int i;
@@ -78,6 +83,7 @@ static void init_cell_entry_buffer(CellEntryBuffer *buf, int n_cells, mwSize cap
     }
 }
 
+/* 向目标 cell 写入一个 entry，particle 保留原粒子编号。 */
 static void insert_cell_entry(CellEntryBuffer *buf, int particle, double x, double y,
                               int cxi, int cyi, int n_cell_x)
 {
@@ -96,6 +102,7 @@ static void insert_cell_entry(CellEntryBuffer *buf, int particle, double x, doub
     buf->count++;
 }
 
+/* 释放 real/ghost entry 链表缓冲区。 */
 static void free_cell_entry_buffer(CellEntryBuffer *buf)
 {
     if (buf->head) mxFree(buf->head);
@@ -163,6 +170,7 @@ static void ensure_capacity(PairBuffer *buf)
     buf->capacity = new_capacity;
 }
 
+/* 释放粒子对缓冲区。 */
 static void free_pair_buffer(PairBuffer *buf)
 {
     if (buf->pair_i) mxFree(buf->pair_i);
@@ -256,7 +264,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     periodic_cutoff = r_cut * h;
     init_cell_entry_buffer(&entries, n_cells, (mwSize)n_total * 3);
 
-    /* 第三步：将所有粒子分配到单元格，并为周期边界附近粒子插入 ghost entry。 */
+    /* 第三步：将所有粒子分配到单元格，并为周期边界附近粒子插入 ghost entry。
+     * 这样跨接缝近邻会重新落回本地 3x3 搜索范围，而不是只依赖 minimum-image。 */
     for (i = 0; i < n_total; ++i) {
         double xi_wrapped = x[i] - floor(x[i] / DL) * DL;
         double yi = y[i];
@@ -289,12 +298,14 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     for (i = 0; i < n_total; ++i) {
         seen_neighbor[i] = -1;
     }
+    /* 关键修复（3d620e8）：同一物理邻居可能同时以 real/ghost entry 出现，
+     * seen_neighbor 用来阻止跨周期重复计数。 */
 
     /* 第四步：初始化粒子对缓冲区（动态数组） */
     init_pair_buffer(&buf, (mwSize)n_fluid * 64 + 1024);
     r_cut_sq = (r_cut * h) * (r_cut * h);
 
-    /* 第六步：遍历所有流体粒子，搜索相邻 9 个单元格内的邻居
+    /* 第五步：遍历所有流体粒子，搜索相邻 9 个单元格内的邻居
      * 流体-流体对：只存储 i < j 避免重复
      * 流体-壁面对：全部存储
      * X 方向周期性：使用最小镜像约定（dx > 0.5DL → dx -= DL） */
@@ -380,7 +391,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         }
     }
 
-    /* 第七步：输出粒子对数据到 MATLAB */
+    /* 第六步：输出粒子对数据到 MATLAB */
     out_count = buf.count;
     plhs[0] = mxCreateDoubleMatrix(out_count, 1, mxREAL);
     plhs[1] = mxCreateDoubleMatrix(out_count, 1, mxREAL);
@@ -401,7 +412,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         memcpy(mxGetDoubles(plhs[6]), buf.dW, out_count * sizeof(double));
     }
 
-    /* 第八步：清理内存 */
+    /* 第七步：清理内存 */
     free_pair_buffer(&buf);
     free_cell_entry_buffer(&entries);
     mxFree(cell_x);

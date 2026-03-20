@@ -1,7 +1,7 @@
 /*
  * sph_physics_mex.c
  * SPH 物理算子 MEX 实现，支持 OpenMP 并行加速。
- * 通过模式字符串分发到不同物理计算：
+ * 通过模式字符串分发到底层物理计算与兼容性门面：
  *
  * Modes:
  *   - density_correction   : 密度重初始化 + 核梯度修正矩阵 B
@@ -9,6 +9,8 @@
  *   - transport_correction : 传输速度修正（抑制张力不稳定性）
  *   - integration_1st      : 第一阶段积分（密度演化 + 压力 + 位置半步 + 压力梯度力）
  *   - integration_2nd      : 第二阶段积分（位置修正 + 密度散度修正）
+ *   - advance_shell_step   : 兼容旧主循环的单步推进门面
+ *   - wall_shear_monitor   : 壁面剪应力监控
  *
  * Build with OpenMP:
  *   Windows (MSVC): mex -R2018a -O COMPFLAGS="$COMPFLAGS /openmp" sph_physics_mex.c
@@ -710,9 +712,9 @@ static void mode_transport_correction(int nlhs, mxArray *plhs[], int nrhs, const
  *   2. 密度半步推进：rho += drho_rate * rho * (dt/2)。
  *   3. 弱可压缩状态方程：p = p0 * (rho/rho0 - 1)。
  *   4. 位置半步推进：pos += vel * (dt/2)。
- *   5. 计算压力梯度力（反对称 SPH 形式，含壁面 Riemann 压力修正）。
+ *   5. 计算压力梯度力（反对称 SPH 形式，含基于法向外加速度的虚拟壁压修正）。
  *
- * 壁面压力：p_wall = p_i + rho_i * r * max(0, -a·e)
+ * 虚拟壁压：p_wall = p_i + rho_i * r * max(0, -a·e)
  *   （法向加速度分量为负时增加壁面压力，防止粒子穿透）
  *
  * 输入（prhs[1..18]）：
@@ -955,6 +957,8 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
 /*
  * mode_integration_2nd
  * 第二阶段积分：位置修正 + 密度散度修正。
+ * 关键修复背景（3d620e8）：这里直接消费邻居列表计算 drho_rate，
+ * 周期接缝一旦漏邻居，会在这一阶段放大成密度散度偏差与剖面接缝。
  *
  * 步骤：
  *   1. 对每对粒子计算速度散度贡献，累加到 drho_rate（连续方程）。
@@ -1111,6 +1115,7 @@ static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxAr
  * 说明：
  *   - 仅负责单步物理推进，不处理周期包裹、壁面 bounding、排序与邻居重建。
  *   - 当前实现优先复用现有 mode，减少对已验证数值内核的侵入。
+ *   - 当前主脚本默认采用拆分后的 dual-criteria 调度，此门面主要保留兼容性。
  *
  * 输入（prhs[1..23]）：
  *   pair_i, pair_j, dx, dy, r, W, dW,

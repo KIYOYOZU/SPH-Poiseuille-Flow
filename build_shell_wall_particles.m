@@ -1,5 +1,9 @@
 function [pos_wall, wall_normal, wall_measure, wall_thickness_arr] = build_shell_wall_particles(DL, DH, dp, wall_thickness)
 %BUILD_SHELL_WALL_PARTICLES 生成上下厚壁粒子区及其几何元数据。
+% wall_measure .* wall_thickness_arr 给出壁粒子的有效体积，
+% 便于 MATLAB 主脚本与 MEX 算子共享同一套壁面离散几何。
+% 关键修复背景（3eb6de0）：这里保留 BW=4dp 厚壁配置，
+% 避免回退到单层 shell 后再次出现壁面支撑不足的问题。
     if nargin < 4
         error('build_shell_wall_particles 需要输入 DL, DH, dp, wall_thickness。');
     end
@@ -28,6 +32,7 @@ function [pos_wall, wall_normal, wall_measure, wall_thickness_arr] = build_shell
 
     n_bottom = size(pos_bottom, 1);
     n_top = size(pos_top, 1);
+    % 法向数组按“下壁块、上壁块”顺序展开，便于后续按粒子块追踪。
     wall_normal = [repmat([0.0, -1.0], n_bottom, 1); repmat([0.0, 1.0], n_top, 1)];
     wall_measure = dp * ones(n_bottom + n_top, 1);
     wall_thickness_arr = dp * ones(n_bottom + n_top, 1);
