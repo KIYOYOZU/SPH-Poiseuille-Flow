@@ -71,7 +71,8 @@ end
 gravity_g = 12.0 * mu * U_bulk / (rho0 * DH^2);  % 等效体积力（驱动泊肃叶流）
 U_max = 1.5 * U_bulk;                             % 中心线最大速度（2D平板泊肃叶流解析关系）
 h = 1.3 * dp;                                   % 光滑长度
-wall_thickness = 4.0 * dp;                       % 厚壁宽度，对齐 SPHinXsys 的 BW = 4dp
+cutoff_depth = ceil((2.0 * h) / dp) * dp;       % shell-contact dummy 至少覆盖核截断半径
+wall_thickness = max(4.0 * dp, cutoff_depth);    % 保留 4dp 下限，同时默认覆盖 cutoff
 periodic_buffer = 0.0;                           % 周期边界立即包裹，不保留额外缓冲带
 transport_coeff = 0.1;                           % dual-criteria 下保守的 shifting 系数
 p0 = rho0 * c_f^2;                              % 参考压力（弱可压缩状态方程）
@@ -97,9 +98,8 @@ y_fluid = (dp/2 : dp : DH - dp/2)';
 pos_fluid = [X_fluid(:), Y_fluid(:)];
 n_fluid = size(pos_fluid, 1);
 
-% 厚壁粒子区：上下各 BW 厚度的规则壁面粒子层
-% 关键修复背景（3eb6de0）：旧单层 shell 壁面支撑不足，
-% 长时算例里会与硬 wall clip 一起放大近壁非物理扰动。
+% 厚壁粒子区：显式保留 dummy 厚度中点层位，
+% 用中点积分保留当前 case 的壁面几何口径与稳定性。
 [pos_wall, wall_normal, wall_measure, wall_thickness_arr] = build_shell_wall_particles(DL, DH, dp, wall_thickness);
 n_wall = size(pos_wall, 1);
 n_total = n_fluid + n_wall;

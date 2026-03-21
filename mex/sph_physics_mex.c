@@ -18,6 +18,7 @@
  */
 
 #include "mex.h"
+#include <limits.h>
 #include <math.h>
 #include <string.h>
 
@@ -99,6 +100,7 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
     const double *dW;
     const double *mass;
     mwSize n_pairs;
+    int n_pairs_i;
     int n_fluid;
     int n_total;
     double rho0;
@@ -140,6 +142,9 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
                   "SPH:Physics:density:pairs", "Pair arrays mismatch.");
 
     mass = mxGetDoubles(prhs[8]);
+    require_count(n_pairs <= (mwSize)INT_MAX, "SPH:Physics:density:pairsize",
+                  "Pair count exceeds INT_MAX.");
+    n_pairs_i = (int)n_pairs;
     n_fluid = (int)mxGetScalar(prhs[9]);
     n_total = (int)mxGetScalar(prhs[10]);
     rho0 = mxGetScalar(prhs[11]);
@@ -172,10 +177,12 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
         sigma_inner[i] = W0;
     }
 
-    #ifdef _OPENMP
+    /* Windows/MSVC 下，这个 mode 的 OpenMP 区域会在 MATLAB 退出阶段触发
+     * 0xc0000005。当前保持 Linux/macOS 并行，Windows 退回串行。 */
+    #if defined(_OPENMP) && !defined(_WIN32)
     #pragma omp parallel for schedule(static)
     #endif
-    for (k = 0; k < n_pairs; ++k) {
+    for (k = 0; k < n_pairs_i; ++k) {
         int ii = (int)pair_i[k] - 1;
         int jj = (int)pair_j[k] - 1;
         double wk = W[k];
@@ -223,10 +230,10 @@ static void mode_density_correction(int nlhs, mxArray *plhs[], int nrhs, const m
         Vol_out[i] = mass[i] / rhoi;
     }
 
-    #ifdef _OPENMP
+    #if defined(_OPENMP) && !defined(_WIN32)
     #pragma omp parallel for schedule(static)
     #endif
-    for (k = 0; k < n_pairs; ++k) {
+    for (k = 0; k < n_pairs_i; ++k) {
         int ii = (int)pair_i[k] - 1;
         int jj = (int)pair_j[k] - 1;
         double rk = r[k];
@@ -1429,9 +1436,9 @@ static void mode_wall_shear_monitor(int nlhs, mxArray *plhs[], int nrhs, const m
         dv_x = vel_x[ii] - wall_vel_x[jj];
         f_pair = 4.0 * mu * eBe * dW[k] * Vol[jj] * dv_x / (rk + 0.01 * h) * Vol[ii];
 
-        if (pos_y[jj] < 0.0) {
+        if (pos_y[jj] <= 0.0) {
             tau_bottom_sum += f_pair;
-        } else if (pos_y[jj] > DH) {
+        } else if (pos_y[jj] >= DH) {
             tau_top_sum += f_pair;
         }
     }
