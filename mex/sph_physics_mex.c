@@ -7,8 +7,9 @@
  *   - density_correction   : 密度重初始化 + 核梯度修正矩阵 B
  *   - viscous_force        : 层流粘性力（含壁面无滑移镜像速度）
  *   - transport_correction : 传输速度修正（抑制张力不稳定性）
- *   - integration_1st      : 第一阶段积分（密度演化 + 压力 + 位置半步 + 压力梯度力）
- *   - integration_2nd      : 第二阶段积分（位置修正 + 密度散度修正）
+ *   - integration_1st      : 旧版第一阶段积分（保留兼容）
+ *   - integration_2nd      : 旧版第二阶段积分（保留兼容）
+ *   - integration_verlet   : 单时间步 Verlet 积分推进
  *   - advance_shell_step   : 兼容旧主循环的单步推进门面
  *   - wall_shear_monitor   : 壁面剪应力监控
  *
@@ -71,6 +72,8 @@ static void get_pair_data(const mxArray *arr_i, const mxArray *arr_j,
     *dW = mxGetDoubles(arr_dW);
     *n_pairs = ni;
 }
+
+static double riemann_beta(double un_l, double un_r, double c_f);
 
 /*
  * mode_density_correction
@@ -881,14 +884,16 @@ static void mode_integration_1st(int nlhs, mxArray *plhs[], int nrhs, const mxAr
         if (jj < n_fluid) {
             double p_i = p_out[ii];
             double p_j = p_out[jj];
+            double rho_bar = 0.5 * (rho_out[ii] + rho_out[jj]);
+            double un_l = vel_x[ii] * ex + vel_y[ii] * ey;
+            double un_r = vel_x[jj] * ex + vel_y[jj] * ey;
+            double beta = riemann_beta(un_l, un_r, c_f);
+            double p_star = 0.5 * (p_i + p_j) + 0.5 * beta * rho_bar * (un_l - un_r);
+            double p_face = 0.5 * (0.5 * (p_i + p_j) + p_star);
             double b11i = B[ii], b12i = B[ii + n_total], b21i = B[ii + 2 * n_total], b22i = B[ii + 3 * n_total];
             double b11j = B[jj], b12j = B[jj + n_total], b21j = B[jj + 2 * n_total], b22j = B[jj + 3 * n_total];
-            double m11 = p_i * b11j + p_j * b11i;
-            double m12 = p_i * b12j + p_j * b12i;
-            double m21 = p_i * b21j + p_j * b21i;
-            double m22 = p_i * b22j + p_j * b22i;
-            double tx = m11 * ex + m12 * ey;
-            double ty = m21 * ex + m22 * ey;
+            double tx = p_face * ((b11i + b11j) * ex + (b12i + b12j) * ey);
+            double ty = p_face * ((b21i + b21j) * ex + (b22i + b22j) * ey);
             double dWVj = dWk * Vol[jj];
             double dWVi = dWk * Vol[ii];
             double p_diff = p_i - p_j;
@@ -1113,11 +1118,361 @@ static void mode_integration_2nd(int nlhs, mxArray *plhs[], int nrhs, const mxAr
     mxFree(drho_rate);
 }
 
+static double riemann_beta(double un_l, double un_r, double c_f)
+{
+    const double eta = 3.0;
+    double compression = un_l - un_r;
+    if (compression < 0.0) {
+        compression = 0.0;
+    }
+    return fmin(eta * compression, c_f);
+}
+
+static void compute_continuity_rate(const double *pair_i, const double *pair_j,
+                                    const double *dx, const double *dy,
+                                    const double *r, const double *dW,
+                                    mwSize n_pairs,
+                                    const double *Vol, const double *rho,
+                                    const double *vel, const double *wall_vel,
+                                    int n_fluid, int n_total,
+                                    double *drho_out)
+{
+    const double *vel_x = vel;
+    const double *vel_y = vel + n_total;
+    const double *wall_vel_x = wall_vel;
+    const double *wall_vel_y = wall_vel + n_total;
+    double *drho_rate = (double *)mxCalloc((mwSize)n_total, sizeof(double));
+    int k;
+
+    memset(drho_out, 0, (mwSize)n_total * sizeof(double));
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (k = 0; k < n_pairs; ++k) {
+        int ii = (int)pair_i[k] - 1;
+        int jj = (int)pair_j[k] - 1;
+        double rk = r[k];
+        double ex, ey;
+        double dWk = dW[k];
+
+        if (ii < 0 || ii >= n_fluid || jj < 0 || jj >= n_total || rk <= 1e-12) {
+            continue;
+        }
+
+        ex = dx[k] / rk;
+        ey = dy[k] / rk;
+
+        if (jj < n_fluid) {
+            double u_jump = (vel_x[ii] - vel_x[jj]) * ex + (vel_y[ii] - vel_y[jj]) * ey;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
+            drho_rate[ii] += u_jump * dWk * Vol[jj];
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
+            drho_rate[jj] += u_jump * dWk * Vol[ii];
+        } else {
+            double vel_jx_in_wall = 2.0 * wall_vel_x[jj] - vel_x[ii];
+            double vel_jy_in_wall = 2.0 * wall_vel_y[jj] - vel_y[ii];
+            double density_jump = (vel_x[ii] - vel_jx_in_wall) * ex + (vel_y[ii] - vel_jy_in_wall) * ey;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
+            drho_rate[ii] += density_jump * dWk * Vol[jj];
+        }
+    }
+
+    for (int i = 0; i < n_fluid; ++i) {
+        drho_out[i] = drho_rate[i] * rho[i];
+    }
+    for (int i = n_fluid; i < n_total; ++i) {
+        drho_out[i] = 0.0;
+    }
+
+    mxFree(drho_rate);
+}
+
+static void compute_pressure_force_riemann(const double *pair_i, const double *pair_j,
+                                           const double *dx, const double *dy,
+                                           const double *r, const double *dW,
+                                           mwSize n_pairs,
+                                           const double *Vol, const double *B,
+                                           const double *rho, const double *p,
+                                           const double *mass, const double *vel,
+                                           const double *force_prior,
+                                           int n_fluid, int n_total,
+                                           double c_f,
+                                           const double *wall_vel,
+                                           double *force_out)
+{
+    const double *vel_x = vel;
+    const double *vel_y = vel + n_total;
+    const double *force_prior_x = force_prior;
+    const double *force_prior_y = force_prior + n_total;
+    const double *wall_vel_x = wall_vel;
+    const double *wall_vel_y = wall_vel + n_total;
+    double *force_x = force_out;
+    double *force_y = force_out + n_total;
+    int k;
+
+    memset(force_out, 0, (mwSize)n_total * 2 * sizeof(double));
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (k = 0; k < n_pairs; ++k) {
+        int ii = (int)pair_i[k] - 1;
+        int jj = (int)pair_j[k] - 1;
+        double rk = r[k];
+        double ex, ey;
+        double dWk = dW[k];
+
+        if (ii < 0 || ii >= n_fluid || jj < 0 || jj >= n_total || rk <= 1e-12) {
+            continue;
+        }
+
+        ex = dx[k] / rk;
+        ey = dy[k] / rk;
+
+        if (jj < n_fluid) {
+            double p_i = p[ii];
+            double p_j = p[jj];
+            double rho_bar = 0.5 * (rho[ii] + rho[jj]);
+            double un_l = vel_x[ii] * ex + vel_y[ii] * ey;
+            double un_r = vel_x[jj] * ex + vel_y[jj] * ey;
+            double beta = riemann_beta(un_l, un_r, c_f);
+            double p_star = 0.5 * (p_i + p_j) + 0.5 * beta * rho_bar * (un_l - un_r);
+            double b11i = B[ii], b12i = B[ii + n_total], b21i = B[ii + 2 * n_total], b22i = B[ii + 3 * n_total];
+            double b11j = B[jj], b12j = B[jj + n_total], b21j = B[jj + 2 * n_total], b22j = B[jj + 3 * n_total];
+            double tx = p_star * ((b11i + b11j) * ex + (b12i + b12j) * ey);
+            double ty = p_star * ((b21i + b21j) * ex + (b22i + b22j) * ey);
+            double dWVj = dWk * Vol[jj];
+            double dWVi = dWk * Vol[ii];
+
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
+            force_x[ii] -= tx * dWVj;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
+            force_y[ii] -= ty * dWVj;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
+            force_x[jj] += tx * dWVi;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
+            force_y[jj] += ty * dWVi;
+        } else {
+            double p_i = p[ii];
+            double ax = force_prior_x[ii] / mass[ii];
+            double ay = force_prior_y[ii] / mass[ii];
+            double p_wall = p_i + rho[ii] * rk * fmax(0.0, -(ax * ex + ay * ey));
+            double b11i = B[ii], b12i = B[ii + n_total], b21i = B[ii + 2 * n_total], b22i = B[ii + 3 * n_total];
+            double dWVj = dWk * Vol[jj];
+            double tx = (p_i + p_wall) * (b11i * ex + b12i * ey);
+            double ty = (p_i + p_wall) * (b21i * ex + b22i * ey);
+
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
+            force_x[ii] -= tx * dWVj;
+            #ifdef _OPENMP
+            #pragma omp atomic
+            #endif
+            force_y[ii] -= ty * dWVj;
+        }
+    }
+
+    for (int i = 0; i < n_fluid; ++i) {
+        force_x[i] *= Vol[i];
+        force_y[i] *= Vol[i];
+    }
+    for (int i = n_fluid; i < n_total; ++i) {
+        force_x[i] = 0.0;
+        force_y[i] = 0.0;
+    }
+}
+
+/*
+ * mode_integration_verlet
+ * 单时间步 5 步显式 Verlet 积分：
+ *   1. 用 rho^n / p^n 计算 a^n
+ *   2. v_half = v^n + 0.5 dt * a^n
+ *   3. r_half = r^n + 0.5 dt * v_half
+ *   4. 用半步速度更新 rho^{n+1}, p^{n+1}，并完成 r^{n+1}
+ *   5. 用 rho^{n+1} / p^{n+1} 计算 a^{n+1}，再更新 v^{n+1}
+ *
+ * 输入（prhs[1..21]）：
+ *   pair_i, pair_j, dx, dy, r, dW,
+ *   Vol, B, rho, mass, pos, vel, drho_dt, force_prior,
+ *   dt, n_fluid, n_total, rho0, p0, c_f, wall_vel
+ * 输出（plhs[0..5]）：rho, p, pos, vel, drho_dt, force
+ */
+static void mode_integration_verlet(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
+{
+    const double *mass;
+    double dt;
+    int n_fluid;
+    int n_total;
+    mxArray *int1_mode = NULL;
+    mxArray *int2_mode = NULL;
+    mxArray *vel_out = NULL;
+    mxArray *rho_out = NULL;
+    mxArray *p_out = NULL;
+    mxArray *force_out = NULL;
+    mxArray *drho_out = NULL;
+    const mxArray *int1_prhs[22];
+    const mxArray *int2_prhs[15];
+    mxArray *int1_plhs[5] = {NULL, NULL, NULL, NULL, NULL};
+    mxArray *int2_plhs[3] = {NULL, NULL, NULL};
+
+    require_count(nrhs == 22, "SPH:Physics:verlet:nrhs",
+                  "integration_verlet expects 21 inputs after mode.");
+    require_count(nlhs == 6, "SPH:Physics:verlet:nlhs",
+                  "integration_verlet expects 6 outputs.");
+
+    mass = mxGetDoubles(prhs[10]);
+    dt = mxGetScalar(prhs[15]);
+    n_fluid = (int)mxGetScalar(prhs[16]);
+    n_total = (int)mxGetScalar(prhs[17]);
+
+    require_count(mxGetNumberOfElements(prhs[7]) == (mwSize)n_total,
+                  "SPH:Physics:verlet:Vol", "Vol size mismatch.");
+    require_count(mxGetM(prhs[8]) == (mwSize)n_total && mxGetN(prhs[8]) == 4,
+                  "SPH:Physics:verlet:B", "B size mismatch.");
+    require_count(mxGetNumberOfElements(prhs[9]) == (mwSize)n_total,
+                  "SPH:Physics:verlet:rho", "rho size mismatch.");
+    require_count(mxGetNumberOfElements(prhs[10]) == (mwSize)n_total,
+                  "SPH:Physics:verlet:mass", "mass size mismatch.");
+    require_count(mxGetM(prhs[11]) == (mwSize)n_total && mxGetN(prhs[11]) == 2,
+                  "SPH:Physics:verlet:pos", "pos size mismatch.");
+    require_count(mxGetM(prhs[12]) == (mwSize)n_total && mxGetN(prhs[12]) == 2,
+                  "SPH:Physics:verlet:vel", "vel size mismatch.");
+    require_count(mxGetNumberOfElements(prhs[13]) == (mwSize)n_total,
+                  "SPH:Physics:verlet:drho", "drho size mismatch.");
+    require_count(mxGetM(prhs[14]) == (mwSize)n_total && mxGetN(prhs[14]) == 2,
+                  "SPH:Physics:verlet:force_prior", "force_prior size mismatch.");
+    require_count(mxGetM(prhs[21]) == (mwSize)n_total && mxGetN(prhs[21]) == 2,
+                  "SPH:Physics:verlet:wall_vel", "wall_vel size mismatch.");
+
+    int1_mode = mxCreateString("integration_1st");
+    int1_prhs[0] = int1_mode;
+    int1_prhs[1] = prhs[1];
+    int1_prhs[2] = prhs[2];
+    int1_prhs[3] = prhs[3];
+    int1_prhs[4] = prhs[4];
+    int1_prhs[5] = prhs[5];
+    int1_prhs[6] = prhs[6];
+    int1_prhs[7] = prhs[7];
+    int1_prhs[8] = prhs[8];
+    int1_prhs[9] = prhs[9];
+    int1_prhs[10] = prhs[10];
+    int1_prhs[11] = prhs[11];
+    int1_prhs[12] = prhs[12];
+    int1_prhs[13] = prhs[13];
+    int1_prhs[14] = prhs[14];
+    int1_prhs[15] = prhs[15];
+    int1_prhs[16] = prhs[16];
+    int1_prhs[17] = prhs[17];
+    int1_prhs[18] = prhs[18];
+    int1_prhs[19] = prhs[19];
+    int1_prhs[20] = prhs[20];
+    int1_prhs[21] = prhs[21];
+    mode_integration_1st(5, int1_plhs, 22, int1_prhs);
+
+    vel_out = mxDuplicateArray(prhs[12]);
+    {
+        double *vel_data = mxGetDoubles(vel_out);
+        const double *force_prior = mxGetDoubles(prhs[14]);
+        const double *force_data = mxGetDoubles(int1_plhs[3]);
+        double *vel_x = vel_data;
+        double *vel_y = vel_data + n_total;
+        const double *force_prior_x = force_prior;
+        const double *force_prior_y = force_prior + n_total;
+        const double *force_x = force_data;
+        const double *force_y = force_data + n_total;
+
+        for (int i = 0; i < n_fluid; ++i) {
+            double inv_mass = 1.0 / mass[i];
+            vel_x[i] += (force_prior_x[i] + force_x[i]) * inv_mass * dt;
+            vel_y[i] += (force_prior_y[i] + force_y[i]) * inv_mass * dt;
+        }
+        for (int i = n_fluid; i < n_total; ++i) {
+            vel_x[i] = 0.0;
+            vel_y[i] = 0.0;
+        }
+    }
+
+    int2_mode = mxCreateString("integration_2nd");
+    int2_prhs[0] = int2_mode;
+    int2_prhs[1] = prhs[1];
+    int2_prhs[2] = prhs[2];
+    int2_prhs[3] = prhs[3];
+    int2_prhs[4] = prhs[4];
+    int2_prhs[5] = prhs[5];
+    int2_prhs[6] = prhs[6];
+    int2_prhs[7] = prhs[7];
+    int2_prhs[8] = int1_plhs[0];
+    int2_prhs[9] = int1_plhs[2];
+    int2_prhs[10] = vel_out;
+    int2_prhs[11] = prhs[15];
+    int2_prhs[12] = prhs[16];
+    int2_prhs[13] = prhs[17];
+    int2_prhs[14] = prhs[21];
+    mode_integration_2nd(3, int2_plhs, 15, int2_prhs);
+
+    rho_out = mxDuplicateArray(int1_plhs[0]);
+    p_out = mxCreateDoubleMatrix(n_total, 1, mxREAL);
+    force_out = mxDuplicateArray(int1_plhs[3]);
+    drho_out = mxDuplicateArray(int2_plhs[1]);
+    {
+        double *rho_data = mxGetDoubles(rho_out);
+        double *p_data = mxGetDoubles(p_out);
+        const double *drho_data = mxGetDoubles(drho_out);
+        double rho0 = mxGetScalar(prhs[18]);
+        double p0 = mxGetScalar(prhs[19]);
+
+        for (int i = 0; i < n_fluid; ++i) {
+            rho_data[i] += drho_data[i] * (0.5 * dt);
+            if (rho_data[i] < 1e-10) {
+                rho_data[i] = rho0;
+            }
+            p_data[i] = p0 * (rho_data[i] / rho0 - 1.0);
+        }
+        for (int i = n_fluid; i < n_total; ++i) {
+            rho_data[i] = mxGetDoubles(int1_plhs[0])[i];
+            p_data[i] = 0.0;
+        }
+    }
+
+    plhs[0] = rho_out;
+    plhs[1] = p_out;
+    plhs[2] = int2_plhs[0];
+    plhs[3] = vel_out;
+    plhs[4] = drho_out;
+    plhs[5] = force_out;
+
+    mxDestroyArray(int1_mode);
+    mxDestroyArray(int2_mode);
+    mxDestroyArray(int1_plhs[1]);
+    mxDestroyArray(int1_plhs[4]);
+    mxDestroyArray(int1_plhs[0]);
+    mxDestroyArray(int1_plhs[2]);
+    mxDestroyArray(int1_plhs[3]);
+    mxDestroyArray(int2_plhs[1]);
+    mxDestroyArray(int2_plhs[2]);
+}
+
 /*
  * mode_advance_shell_step
- * 单步物理推进门面：
+ * 兼容旧门面：
  *   density_correction -> viscous_force -> transport_correction
- *   -> integration_1st -> velocity update -> integration_2nd
+ *   -> integration_verlet
  *
  * 说明：
  *   - 仅负责单步物理推进，不处理周期包裹、壁面 bounding、排序与邻居重建。
@@ -1143,22 +1498,17 @@ static void mode_advance_shell_step(int nlhs, mxArray *plhs[], int nrhs, const m
     mxArray *density_mode = NULL;
     mxArray *viscous_mode = NULL;
     mxArray *transport_mode = NULL;
-    mxArray *int1_mode = NULL;
-    mxArray *int2_mode = NULL;
-    mxArray *vel_out = NULL;
-    mxArray *rho_out = NULL;
+    mxArray *verlet_mode = NULL;
 
     mxArray *density_plhs[3] = {NULL, NULL, NULL};
     mxArray *viscous_plhs[1] = {NULL};
     mxArray *transport_plhs[1] = {NULL};
-    mxArray *int1_plhs[5] = {NULL, NULL, NULL, NULL, NULL};
-    mxArray *int2_plhs[3] = {NULL, NULL, NULL};
+    mxArray *verlet_plhs[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
 
     const mxArray *density_prhs[14];
     const mxArray *viscous_prhs[16];
     const mxArray *transport_prhs[13];
-    const mxArray *int1_prhs[22];
-    const mxArray *int2_prhs[15];
+    const mxArray *verlet_prhs[22];
 
     require_count(nrhs == 24, "SPH:Physics:advance:nrhs",
                   "advance_shell_step expects 23 inputs after mode.");
@@ -1245,87 +1595,37 @@ static void mode_advance_shell_step(int nlhs, mxArray *plhs[], int nrhs, const m
     transport_prhs[12] = prhs[16];
     mode_transport_correction(1, transport_plhs, 13, transport_prhs);
 
-    int1_mode = mxCreateString("integration_1st");
-    int1_prhs[0] = int1_mode;
-    int1_prhs[1] = prhs[1];
-    int1_prhs[2] = prhs[2];
-    int1_prhs[3] = prhs[3];
-    int1_prhs[4] = prhs[4];
-    int1_prhs[5] = prhs[5];
-    int1_prhs[6] = prhs[7];
-    int1_prhs[7] = density_plhs[1];
-    int1_prhs[8] = density_plhs[2];
-    int1_prhs[9] = density_plhs[0];
-    int1_prhs[10] = prhs[8];
-    int1_prhs[11] = transport_plhs[0];
-    int1_prhs[12] = prhs[10];
-    int1_prhs[13] = prhs[13];
-    int1_prhs[14] = viscous_plhs[0];
-    int1_prhs[15] = prhs[14];
-    int1_prhs[16] = prhs[15];
-    int1_prhs[17] = prhs[16];
-    int1_prhs[18] = prhs[17];
-    int1_prhs[19] = prhs[18];
-    int1_prhs[20] = prhs[19];
-    int1_prhs[21] = prhs[11];
-    mode_integration_1st(5, int1_plhs, 22, int1_prhs);
+    verlet_mode = mxCreateString("integration_verlet");
+    verlet_prhs[0] = verlet_mode;
+    verlet_prhs[1] = prhs[1];
+    verlet_prhs[2] = prhs[2];
+    verlet_prhs[3] = prhs[3];
+    verlet_prhs[4] = prhs[4];
+    verlet_prhs[5] = prhs[5];
+    verlet_prhs[6] = prhs[7];
+    verlet_prhs[7] = density_plhs[1];
+    verlet_prhs[8] = density_plhs[2];
+    verlet_prhs[9] = density_plhs[0];
+    verlet_prhs[10] = prhs[8];
+    verlet_prhs[11] = transport_plhs[0];
+    verlet_prhs[12] = prhs[10];
+    verlet_prhs[13] = prhs[13];
+    verlet_prhs[14] = viscous_plhs[0];
+    verlet_prhs[15] = prhs[14];
+    verlet_prhs[16] = prhs[15];
+    verlet_prhs[17] = prhs[16];
+    verlet_prhs[18] = prhs[17];
+    verlet_prhs[19] = prhs[18];
+    verlet_prhs[20] = prhs[19];
+    verlet_prhs[21] = prhs[11];
+    mode_integration_verlet(6, verlet_plhs, 22, verlet_prhs);
 
-    vel_out = mxDuplicateArray(prhs[10]);
-    {
-        double *vel_data = mxGetDoubles(vel_out);
-        const double *force_prior = mxGetDoubles(viscous_plhs[0]);
-        const double *force_data = mxGetDoubles(int1_plhs[3]);
-        double *vel_x = vel_data;
-        double *vel_y = vel_data + n_total;
-        const double *force_prior_x = force_prior;
-        const double *force_prior_y = force_prior + n_total;
-        const double *force_x = force_data;
-        const double *force_y = force_data + n_total;
-
-        for (int i = 0; i < n_fluid; ++i) {
-            double inv_mass = 1.0 / mass[i];
-            vel_x[i] += (force_prior_x[i] + force_x[i]) * inv_mass * dt;
-            vel_y[i] += (force_prior_y[i] + force_y[i]) * inv_mass * dt;
-        }
-        for (int i = n_fluid; i < n_total; ++i) {
-            vel_x[i] = 0.0;
-            vel_y[i] = 0.0;
-        }
-    }
-
-    int2_mode = mxCreateString("integration_2nd");
-    int2_prhs[0] = int2_mode;
-    int2_prhs[1] = prhs[1];
-    int2_prhs[2] = prhs[2];
-    int2_prhs[3] = prhs[3];
-    int2_prhs[4] = prhs[4];
-    int2_prhs[5] = prhs[5];
-    int2_prhs[6] = prhs[7];
-    int2_prhs[7] = density_plhs[1];
-    int2_prhs[8] = int1_plhs[0];
-    int2_prhs[9] = int1_plhs[2];
-    int2_prhs[10] = vel_out;
-    int2_prhs[11] = prhs[14];
-    int2_prhs[12] = prhs[15];
-    int2_prhs[13] = prhs[16];
-    int2_prhs[14] = prhs[11];
-    mode_integration_2nd(3, int2_plhs, 15, int2_prhs);
-
-    rho_out = mxDuplicateArray(int1_plhs[0]);
-    {
-        double *rho_data = mxGetDoubles(rho_out);
-        const double *drho_data = mxGetDoubles(int2_plhs[1]);
-        for (int i = 0; i < n_fluid; ++i) {
-            rho_data[i] += drho_data[i] * (0.5 * dt);
-        }
-    }
-
-    plhs[0] = rho_out;
-    plhs[1] = int1_plhs[1];
-    plhs[2] = int2_plhs[0];
-    plhs[3] = vel_out;
-    plhs[4] = int2_plhs[1];
-    plhs[5] = int1_plhs[3];
+    plhs[0] = verlet_plhs[0];
+    plhs[1] = verlet_plhs[1];
+    plhs[2] = verlet_plhs[2];
+    plhs[3] = verlet_plhs[3];
+    plhs[4] = verlet_plhs[4];
+    plhs[5] = verlet_plhs[5];
     plhs[6] = viscous_plhs[0];
     plhs[7] = density_plhs[1];
     plhs[8] = density_plhs[2];
@@ -1333,14 +1633,9 @@ static void mode_advance_shell_step(int nlhs, mxArray *plhs[], int nrhs, const m
     mxDestroyArray(density_mode);
     mxDestroyArray(viscous_mode);
     mxDestroyArray(transport_mode);
-    mxDestroyArray(int1_mode);
-    mxDestroyArray(int2_mode);
+    mxDestroyArray(verlet_mode);
     mxDestroyArray(density_plhs[0]);
     mxDestroyArray(transport_plhs[0]);
-    mxDestroyArray(int1_plhs[0]);
-    mxDestroyArray(int1_plhs[2]);
-    mxDestroyArray(int1_plhs[4]);
-    mxDestroyArray(int2_plhs[2]);
 }
 
 /*
@@ -1465,6 +1760,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         mode_integration_1st(nlhs, plhs, nrhs, prhs);
     } else if (strcmp(mode, "integration_2nd") == 0) {
         mode_integration_2nd(nlhs, plhs, nrhs, prhs);
+    } else if (strcmp(mode, "integration_verlet") == 0) {
+        mode_integration_verlet(nlhs, plhs, nrhs, prhs);
     } else if (strcmp(mode, "advance_shell_step") == 0) {
         mode_advance_shell_step(nlhs, plhs, nrhs, prhs);
     } else if (strcmp(mode, "wall_shear_monitor") == 0) {

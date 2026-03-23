@@ -74,7 +74,7 @@ h = 1.3 * dp;                                   % 光滑长度
 cutoff_depth = ceil((2.0 * h) / dp) * dp;       % shell-contact dummy 至少覆盖核截断半径
 wall_thickness = max(4.0 * dp, cutoff_depth);    % 保留 4dp 下限，同时默认覆盖 cutoff
 periodic_buffer = 0.0;                           % 周期边界立即包裹，不保留额外缓冲带
-transport_coeff = 0.1;                           % dual-criteria 下保守的 shifting 系数
+transport_coeff = 0.30;                          % 再增强一档 shifting，目标是压过 20s 行内散布阈值
 p0 = rho0 * c_f^2;                              % 参考压力（弱可压缩状态方程）
 inv_sigma0 = dp^2;                               % 核函数归一化因子的倒数
 nu = mu / rho0;                                  % 运动粘度
@@ -244,54 +244,27 @@ monitor.profile_times(end + 1, 1) = state.t;
 monitor.mid_profile_u(:, end + 1) = u_mid_init;
 
 %% S6: 主循环（dual-criteria 时间步进）
-% 每个外层对流/黏性步 Dt 只做一次密度求和、核修正、粘性力和传输修正，
-% 然后在 Dt 内部执行多次声学子步推进压力/密度松弛。
-% 关键修复背景（3eb6de0）：旧版“单层 CFL + 每步较强 transport correction”
-% 会持续放大近壁横向脉动，所以当前把 shifting 限定在外层步。
 while state.t < cfg.t_end - 1e-12
     target_time = min(state.t + cfg.output_interval, cfg.t_end);
 
     while state.t < target_time - 1e-12
         state.step = state.step + 1;
-
-        remain_outer = min(target_time - state.t, cfg.t_end - state.t);
-        Dt_outer = advection_viscous_time_step( ...
-            state.vel(1:geom.n_fluid, :), state.force(1:geom.n_fluid, :), ...
-            state.force_prior(1:geom.n_fluid, :), geom.mass(1:geom.n_fluid), ...
-            cfg.U_bulk, cfg.nu, cfg.h, remain_outer);
-        if Dt_outer < 1e-14
-            error('外层时间步退化为零（Dt=%.2e），仿真在 t=%.6f step=%d 发散。', ...
-                Dt_outer, state.t, state.step);
-        end
+        remain = min(target_time - state.t, cfg.t_end - state.t);
 
         [state.rho, state.Vol, state.B] = density_correction_mex( ...
             neighbor, geom.mass, geom.n_fluid, geom.n_total, cfg, physics_mex_name);
         state.force_prior = compute_force_prior_mex(state, geom, neighbor, cfg, physics_mex_name);
         state.pos = transport_correction_mex(state.pos, state.Vol, state.B, neighbor, geom, cfg, physics_mex_name);
 
-        relaxation_time = 0.0;
-        dt_inner = 0.0;
-        while relaxation_time < Dt_outer - 1e-12
-            dt_inner = cfl_time_step(state.vel(1:geom.n_fluid, :), cfg.c_f, cfg.h, Dt_outer - relaxation_time);
-            dt_inner = min(dt_inner, target_time - state.t);
-            dt_inner = min(dt_inner, cfg.t_end - state.t);
-            if dt_inner < 1e-14
-                error('声学时间步退化为零（dt=%.2e），仿真在 t=%.6f step=%d 发散。', ...
-                    dt_inner, state.t, state.step);
-            end
-
-            [state.rho, state.p, state.pos, state.force, state.drho_dt] = integration_1st_mex( ...
-                state, geom, neighbor, cfg, dt_inner, physics_mex_name);
-            state.vel = update_velocity(state.vel, geom.mass, state.force_prior, state.force, geom.n_fluid, geom.n_total, dt_inner);
-            [state.pos, state.drho_dt] = integration_2nd_mex( ...
-                state, geom, neighbor, dt_inner, physics_mex_name);
-            state.rho(1:geom.n_fluid) = state.rho(1:geom.n_fluid) + state.drho_dt(1:geom.n_fluid) * (0.5 * dt_inner);
-            state.p(1:geom.n_fluid) = cfg.p0 * (state.rho(1:geom.n_fluid) ./ cfg.rho0 - 1.0);
-            state.p(geom.n_fluid+1:end) = 0.0;
-
-            relaxation_time = relaxation_time + dt_inner;
-            state.t = state.t + dt_inner;
+        dt_step = verlet_time_step(state.vel(1:geom.n_fluid, :), cfg.c_f, cfg.h, cfg.nu, cfg.gravity_g, remain);
+        if dt_step < 1e-14
+            error('统一 Verlet 时间步退化为零（dt=%.2e），仿真在 t=%.6f step=%d 发散。', ...
+                dt_step, state.t, state.step);
         end
+
+        [state.rho, state.p, state.pos, state.vel, state.drho_dt, state.force] = integration_verlet_mex( ...
+            state, geom, neighbor, cfg, dt_step, physics_mex_name);
+        state.t = state.t + dt_step;
 
         [state.pos, ~] = periodic_bounding(state.pos, geom.n_fluid, cfg.DL, cfg.periodic_buffer);
         state.vel(geom.n_fluid+1:end, :) = 0.0;
@@ -311,8 +284,8 @@ while state.t < cfg.t_end - 1e-12
 
         if mod(state.step, 20) == 0
             vmax = max(vecnorm(state.vel(1:geom.n_fluid, :), 2, 2));
-            fprintf('step=%d, t=%.6f/%.6f, Dt=%.4e, dt=%.4e, pairs=%d, vmax=%.4f\n', ...
-                state.step, state.t, cfg.t_end, Dt_outer, dt_inner, numel(neighbor.pair_i), vmax);
+            fprintf('step=%d, t=%.6f/%.6f, dt=%.4e, pairs=%d, vmax=%.4f\n', ...
+                state.step, state.t, cfg.t_end, dt_step, numel(neighbor.pair_i), vmax);
             fprintf('  [thick-wall-noslip] tau_bot=%.4f, tau_top=%.4f, tau_target=%.4f\n', ...
                 monitor.tau_num_bottom, monitor.tau_num_top, monitor.tau_target);
         end
@@ -331,6 +304,7 @@ end
 %% S7: 写出独立后处理所需数据
 postprocess_data = make_postprocess_data(cfg, geom, state, monitor, result_png, profile_evolution_png);
 save_postprocess_data(postprocess_mat_path, postprocess_data);
+SPH_Poiseuille_postprocess(postprocess_mat_path);
 fprintf('后处理数据已保存: %s\n', postprocess_mat_path);
 fprintf('后处理请单独运行: matlab -batch "cd(''%s''); SPH_Poiseuille_postprocess(''%s'');"\n', ...
     project_dir, postprocess_mat_path);
@@ -427,39 +401,13 @@ function pos = transport_correction_mex(pos, Vol, B, neighbor, geom, cfg, physic
         Vol, B, pos, cfg.h, geom.n_fluid, geom.n_total, cfg.transport_coeff);
 end
 
-function [rho, p, pos, force, drho_dt] = integration_1st_mex(state, geom, neighbor, cfg, dt_step, physics_mex_name)
-% 第一阶段声学子步：半步推进 rho/pos，并计算压力梯度力。
-    [rho, p, pos, force, drho_dt] = feval( ...
-        physics_mex_name, 'integration_1st', ...
+function [rho, p, pos, vel, drho_dt, force] = integration_verlet_mex(state, geom, neighbor, cfg, dt_step, physics_mex_name)
+% 单时间步 Verlet 推进：一次完成 rho/p/pos/vel/drho_dt/force 更新。
+    [rho, p, pos, vel, drho_dt, force] = feval( ...
+        physics_mex_name, 'integration_verlet', ...
         neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.dW_ij, ...
         state.Vol, state.B, state.rho, geom.mass, state.pos, state.vel, state.drho_dt, state.force_prior, ...
         dt_step, geom.n_fluid, geom.n_total, cfg.rho0, cfg.p0, cfg.c_f, geom.wall_vel);
-end
-
-function vel = update_velocity(vel, mass, force_prior, force, n_fluid, n_total, dt_step)
-% 用黏性先验力与压力力更新流体速度，壁粒子速度始终保持零。
-    acc_fluid = (force_prior(1:n_fluid, :) + force(1:n_fluid, :)) ./ mass(1:n_fluid);
-    vel(1:n_fluid, :) = vel(1:n_fluid, :) + acc_fluid * dt_step;
-    vel(n_fluid+1:n_total, :) = 0.0;
-end
-
-function [pos, drho_dt] = integration_2nd_mex(state, geom, neighbor, dt_step, physics_mex_name)
-% 第二阶段声学子步：完成位置推进，并返回密度散度修正项。
-    [pos, drho_dt, ~] = feval( ...
-        physics_mex_name, 'integration_2nd', ...
-        neighbor.pair_i, neighbor.pair_j, neighbor.dx_ij, neighbor.dy_ij, neighbor.r_ij, neighbor.dW_ij, ...
-        state.Vol, state.rho, state.pos, state.vel, dt_step, geom.n_fluid, geom.n_total, geom.wall_vel);
-end
-
-function Dt = advection_viscous_time_step(vel, force, force_prior, mass, U_ref, nu, h, remain)
-% Dual-criteria 外层时间步：对流/黏性尺度控制一次配置更新的间隔
-    accel_norm = vecnorm(force + force_prior, 2, 2);
-    accel_scale = 4.0 * h * accel_norm ./ max(mass, eps);
-    speed_sq = vecnorm(vel, 2, 2) .^ 2;
-    speed_max = sqrt(max([speed_sq; accel_scale; 0.0]));
-    speed_ref = max(U_ref, nu / max(h, eps));
-    Dt = min(0.25 * h / max(max(speed_max, speed_ref), 1e-12), remain);
-    Dt = max(Dt, 1e-12);
 end
 
 function sink = void_buffer(~)
@@ -568,12 +516,13 @@ function sig = create_config_signature(DL, DH, dp, rho0, mu, U_bulk, c_f, t_end,
         DL, DH, dp, rho0, mu, U_bulk, c_f, t_end, output_interval, sort_interval);
 end
 
-function dt = cfl_time_step(vel, c_f, h, remain)
-% 统一 CFL 时间步长：dt = 0.3 * h / (c + |v|_max)，不超过剩余时间
-    signal = c_f + vecnorm(vel, 2, 2);
-    max_signal = max(signal);
-    max_signal = max(max_signal, 1e-12);
-    dt = min(0.3 * h / max_signal, remain);
+function dt = verlet_time_step(vel, c_max, h, nu, gravity_g, remain)
+% 单时间步 Verlet：声速/黏性/体力三重约束统一取最小值。
+    v_max = max(vecnorm(vel, 2, 2));
+    dt_acoustic = 0.25 * h / max(c_max + v_max, 1e-12);
+    dt_viscous = 0.125 * h * h / max(nu, 1e-12);
+    dt_body = 0.25 * sqrt(h / max(abs(gravity_g), 1e-12));
+    dt = min([dt_acoustic, dt_viscous, dt_body, remain]);
     dt = max(dt, 1e-12);
 end
 
